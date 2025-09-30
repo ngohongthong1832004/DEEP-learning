@@ -1,0 +1,21 @@
+# Bỏ toàn bộ tk1
+tk1/*
+
+# Nhưng giữ lại folder train trong tk1
+!tk1/train/
+!tk1/train/**
+
+# Giữ lại các file code trong tk1 (py, ipynb, md)
+!tk1/*.py
+!tk1/*.ipynb
+!tk1/*.md
+
+# Virtual env & cache
+.venv
+__pycache__/
+*.pyc
+
+# System / IDE
+.DS_Store
+.idea
+.vscode
