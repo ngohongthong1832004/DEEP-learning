@@ -43,9 +43,9 @@ CONFIG = {
     
     # Training
     'img_size': 224,  # Start small and progressively increase
-    'batch_size': 256,
-    'epochs': 20,
-    'lr': 2e-4,  # Slightly increased learning rate
+    'batch_size': 512,  # Increased to utilize more GPU memory
+    'epochs': 40,
+    'lr': 1e-4,  # Slightly increased learning rate
     
     # Progressive Resizing - increase only, within training epochs
     'use_progressive_resize': True,
@@ -53,8 +53,16 @@ CONFIG = {
         1: 224,
         5: 256,
         10: 288,
-        15: 320
+        15: 320,
+        20: 384  # Increased max size to utilize more GPU memory
     },
+    
+    # Performance optimization
+    'gradient_accumulation_steps': 1,  # Can increase for very large effective batch size
+    'num_workers': 8,  # Increased for better CPU-GPU data pipeline
+    'pin_memory': True,
+    'persistent_workers': True,
+    'prefetch_factor': 4,
     
     # Augmentation
     'use_mixup': True,
@@ -69,7 +77,7 @@ CONFIG = {
     'tta_transforms': 5,
     
     # YOLO
-    'yolo_epochs': 20,
+    'yolo_epochs': 40,
     'yolo_imgsz': 640,
     'yolo_batch': 16,
     'yolo_conf': 0.25,
@@ -1019,7 +1027,29 @@ def setup_amp():
     else:
         scaler = GradScaler(enabled=use_cuda)
     
+    # Clear GPU cache to start fresh
+    if use_cuda:
+        torch.cuda.empty_cache()
+        logging.info(f"GPU Memory before training: {torch.cuda.memory_allocated()/1024**3:.2f}GB / {torch.cuda.memory_reserved()/1024**3:.2f}GB")
+    
     return DEVICE, amp_ctx, scaler
+
+def log_gpu_memory(epoch=None, step=None):
+    """Log current GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        cached = torch.cuda.memory_reserved() / 1024**3
+        max_mem = torch.cuda.max_memory_allocated() / 1024**3
+        
+        prefix = ""
+        if epoch is not None:
+            prefix += f"Epoch {epoch}"
+        if step is not None:
+            prefix += f" Step {step}"
+        if prefix:
+            prefix += ": "
+            
+        logging.info(f"{prefix}GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB, Max: {max_mem:.2f}GB")
 
 def train_enhanced_model(model, train_df, val_df, epochs):
     device, amp_ctx, scaler = setup_amp()
@@ -1067,17 +1097,35 @@ def train_enhanced_model(model, train_df, val_df, epochs):
         
         val_dataset = CropDataset(val_df, transform=val_transform)
         
-        train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], 
-                                 shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], 
-                               shuffle=False, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=CONFIG['batch_size'], 
+            shuffle=True, 
+            num_workers=CONFIG['num_workers'], 
+            pin_memory=CONFIG['pin_memory'],
+            persistent_workers=CONFIG['persistent_workers'],
+            prefetch_factor=CONFIG['prefetch_factor']
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=CONFIG['batch_size'], 
+            shuffle=False, 
+            num_workers=CONFIG['num_workers'], 
+            pin_memory=CONFIG['pin_memory'],
+            persistent_workers=CONFIG['persistent_workers'],
+            prefetch_factor=CONFIG['prefetch_factor']
+        )
         
         # Train
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
-        for batch in pbar:
+        # Gradient accumulation setup
+        accumulation_steps = CONFIG['gradient_accumulation_steps']
+        effective_batch_size = CONFIG['batch_size'] * accumulation_steps
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} (BS:{effective_batch_size})")
+        for batch_idx, batch in enumerate(pbar):
             # Check if we should use strong augmentation (disable in last 20% of epochs)
             use_strong_aug = epoch <= int(0.8 * epochs)
             enable_mixup = CONFIG['use_mixup'] and use_strong_aug
@@ -1101,7 +1149,10 @@ def train_enhanced_model(model, train_df, val_df, epochs):
                     # CutMix returns scalar lam, convert to per-sample
                     lam = torch.full((imgs.size(0), 1), float(lam_cutmix), device=device)
                 
-                optimizer.zero_grad()
+                # Only zero gradients at the start of accumulation
+                if batch_idx % accumulation_steps == 0:
+                    optimizer.zero_grad()
+                
                 with amp_ctx:
                     outputs = model(imgs)
                     # Per-sample loss calculation
@@ -1115,9 +1166,16 @@ def train_enhanced_model(model, train_df, val_df, epochs):
                         loss2 = F.cross_entropy(outputs, labels2, reduction='none')  # [B]
                         loss = (lam.squeeze(1) * loss1 + (1-lam.squeeze(1)) * loss2).mean()
                 
+                # Scale loss by accumulation steps
+                loss = loss / accumulation_steps
+                
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                
+                # Only step optimizer every accumulation_steps
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
                 
                 train_loss += loss.item() * imgs.size(0)
                 # Per-sample accuracy estimation
@@ -1135,7 +1193,10 @@ def train_enhanced_model(model, train_df, val_df, epochs):
                     imgs, labels_a, labels_b, lam = cutmix(imgs, labels, CONFIG['cutmix_alpha'])
                     lam = torch.tensor(float(lam), device=device, dtype=torch.float32)
                     
-                    optimizer.zero_grad()
+                    # Only zero gradients at the start of accumulation
+                    if batch_idx % accumulation_steps == 0:
+                        optimizer.zero_grad()
+                    
                     with amp_ctx:
                         outputs = model(imgs)
                         # Use consistent loss function
@@ -1148,23 +1209,40 @@ def train_enhanced_model(model, train_df, val_df, epochs):
                             loss2 = F.cross_entropy(outputs, labels_b, reduction='none')
                             loss = (lam * loss1 + (1-lam) * loss2).mean()
                     
+                    # Scale loss by accumulation steps
+                    loss = loss / accumulation_steps
+                    
                     scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    
+                    # Only step optimizer every accumulation_steps
+                    if (batch_idx + 1) % accumulation_steps == 0:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
                     
                     train_loss += loss.item() * imgs.size(0)
                     train_correct += (lam * (outputs.argmax(1) == labels_a).float() + 
                                     (1-lam) * (outputs.argmax(1) == labels_b).float()).sum().item()
                     train_total += imgs.size(0)
                 else:
-                    optimizer.zero_grad()
+                    # Only zero gradients at the start of accumulation
+                    if batch_idx % accumulation_steps == 0:
+                        optimizer.zero_grad()
+                        
                     with amp_ctx:
                         outputs = model(imgs)
                         loss = criterion(outputs, labels)
                     
+                    # Scale loss by accumulation steps
+                    loss = loss / accumulation_steps
+                    
                     scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    
+                    # Only step optimizer every accumulation_steps
+                    if (batch_idx + 1) % accumulation_steps == 0:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
                     
                     train_loss += loss.item() * imgs.size(0)
                     train_correct += (outputs.argmax(1) == labels).sum().item()
@@ -1199,6 +1277,14 @@ def train_enhanced_model(model, train_df, val_df, epochs):
         history["val_acc"].append(val_acc)
         
         logging.info(f"Epoch {epoch}: TL={train_loss:.4f} TA={train_acc:.4f} VL={val_loss:.4f} VA={val_acc:.4f}")
+        
+        # Log GPU memory usage
+        if epoch % 5 == 0 or epoch == 1:
+            log_gpu_memory(epoch=epoch)
+            
+        # Clean up GPU memory periodically
+        if epoch % 10 == 0:
+            torch.cuda.empty_cache()
         
         scheduler.step()
         
@@ -1455,8 +1541,15 @@ else:
     # Standard test
     _, val_transform = get_transforms(CONFIG['img_size'])
     test_dataset = CropDataset(test_crops, transform=val_transform)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False, 
-                            num_workers=4, pin_memory=True)
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=CONFIG['batch_size'], 
+        shuffle=False, 
+        num_workers=CONFIG['num_workers'], 
+        pin_memory=CONFIG['pin_memory'],
+        persistent_workers=CONFIG['persistent_workers'],
+        prefetch_factor=CONFIG['prefetch_factor']
+    )
     
     model.eval()
     all_preds, all_labels = [], []
