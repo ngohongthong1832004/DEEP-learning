@@ -1,6 +1,6 @@
 # %% [markdown]
-# # Complete Pipeline + Enhanced MobileNetV3-Small
-# Full pipeline with all visualizations + CBAM, Enhanced Head, CutMix, Progressive Resizing, TTA
+# # Optimized Rice Disease Detection Pipeline
+# Complete pipeline with lesion-aware filtering, robust training, and comprehensive visualization
 
 # %%
 # ===== IMPORTS =====
@@ -15,13 +15,14 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 from typing import Dict, List, Tuple
+from copy import deepcopy
 import warnings
 warnings.filterwarnings('ignore')
 
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 
 try:
@@ -35,49 +36,78 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
 
 # %%
-# ===== CONFIGURATION =====
+# ===== REPRODUCIBILITY =====
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(42)
+
+# %%
+# ===== OPTIMIZED CONFIGURATION =====
 CONFIG = {
+    # Backbone selection
+    'backbone': 'efficientnet_v2_s',  # 'mobilenetv3_small' | 'efficientnet_v2_s'
+    
     # Model Enhancements
-    'use_cbam': True,                    # CBAM attention module
-    'use_better_head': True,             # Enhanced classification head
+    'use_cbam': True,
+    'use_better_head': True,
     
-    # Training
-    'img_size': 224,  # Start small and progressively increase
-    'batch_size': 512,  # Increased to utilize more GPU memory
-    'epochs': 40,
-    'lr': 1e-4,  # Slightly increased learning rate
+    # Training - Conservative memory settings
+    'img_size': 224,
+    'batch_size': 128,  # Very safe for 22GB VRAM
+    'epochs': 60,
+    'lr': 3e-4,
+    'warmup_epochs': 3,
     
-    # Progressive Resizing - increase only, within training epochs
+    # Progressive Resizing - Smaller sizes
     'use_progressive_resize': True,
     'progressive_schedule': {
         1: 224,
-        5: 256,
-        10: 288,
-        15: 320,
-        20: 384  # Increased max size to utilize more GPU memory
+        10: 256,
+        25: 288,   # Reduced from 320
+        45: 320    # Reduced from 384, later epoch
     },
     
-    # Performance optimization
-    'gradient_accumulation_steps': 1,  # Can increase for very large effective batch size
-    'num_workers': 8,  # Increased for better CPU-GPU data pipeline
+    # Data loader - Ultra conservative
+    'num_workers': 4,  # Further reduced to save memory
     'pin_memory': True,
-    'persistent_workers': True,
-    'prefetch_factor': 4,
+    'persistent_workers': False,  # Disable to save memory
+    'prefetch_factor': 2,  # Minimal prefetch
     
-    # Augmentation
-    'use_mixup': True,
-    'use_cutmix': True,
-    'mixup_alpha': 0.2,
-    'cutmix_alpha': 1.0,
-    'use_label_smoothing': True,
-    'label_smooth_eps': 0.1,
+    # GPU Optimization - Conservative settings
+    'gradient_accumulation_steps': 4,  # Effective batch size = 128*4 = 512
+    
+    # Memory optimization - Very conservative
+    'max_memory_allocated': 15.0,  # Max GB to use (leave 7GB buffer)
+    'memory_cleanup_frequency': 3,  # Clean memory every 3 batches
+    
+    # Robust Training
+    'use_weighted_sampler': True,
+    'use_sce_loss': True,           # Symmetric Cross-Entropy
+    'sce_alpha': 0.1,
+    'sce_beta': 1.0,
+    'use_logit_adjustment': True,
+    'logit_adjustment_tau': 1.0,
+    'use_ema': True,
+    'ema_decay': 0.999,
+    
+    # Augmentation (disabled initially for noisy labels)
+    'use_mixup': False,
+    'use_cutmix': False,
+    'use_label_smoothing': False,
     
     # Inference
     'use_tta': True,
     'tta_transforms': 5,
     
-    # YOLO
-    'yolo_epochs': 40,
+    # YOLO (LEAF DETECTION ONLY)
+    'yolo_epochs': 30,
     'yolo_imgsz': 640,
     'yolo_batch': 16,
     'yolo_conf': 0.25,
@@ -85,6 +115,10 @@ CONFIG = {
     # Splits
     'val_size': 0.15,
     'test_size': 0.15,
+    
+    # Crop Filtering
+    'crops_per_image': 3,
+    'min_crop_size': 64,
 }
 
 # %%
@@ -96,7 +130,7 @@ def get_output_folder(parent_dir: str, env_name: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
-PATH_OUTPUT = get_output_folder("../output", "GK-final")
+PATH_OUTPUT = get_output_folder("../output", "GK-optimized")
 
 def create_output_structure(base_path):
     folders = ["field_images", "yolo_weights", "crops", "crop_samples",
@@ -129,48 +163,11 @@ logger = setup_logging(PATH_OUTPUT)
 
 # %%
 # ===== LABELS =====
-# LABELS = {
-#     0: {"name": "brown_spot", "match_substrings": [
-#         "../data/rice-disease-dataset/Rice_Leaf_AUG/Brown Spot",
-#         "../data/rice-leaf-disease-image/Brownspot",
-#         "../data/rice-leaf-diseases/rice_leaf_diseases/Brown spot",
-#         "../data/rice-leafs-disease-dataset/RiceLeafsDisease/train/brown_spot",
-#         "../data/rice-leaf-images/rice_images/_BrownSpot",
-#         "../data/rice-diseases-image-dataset/RiceDiseaseDataset/train/BrownSpot",
-#     ]},
-#     1: {"name": "leaf_blast", "match_substrings": [
-#         "../data/rice-disease-dataset/Rice_Leaf_AUG/Leaf Blast",
-#         "../data/rice-leafs-disease-dataset/RiceLeafsDisease/train/leaf_blast",
-#         "../data/rice-leaf-images/rice_images/_LeafBlast",
-#         "../data/rice-diseases-image-dataset/RiceDiseaseDataset/train/LeafBlast",
-#     ]},
-#     2: {"name": "leaf_blight", "match_substrings": [
-#         "../data/rice-disease-dataset/Rice_Leaf_AUG/Sheath Blight",
-#         "../data/rice-leaf-diseases/rice_leaf_diseases/Bacterial leaf blight",
-#         "../data/rice-leaf-disease-image/Bacterialblight",
-#         "../data/rice-leafs-disease-dataset/RiceLeafsDisease/train/bacterial_leaf_blight",
-#     ]},
-#     3: {"name": "healthy", "match_substrings": [
-#         "../data/rice-disease-dataset/Rice_Leaf_AUG/Healthy Rice Leaf",
-#         "../data/rice-leafs-disease-dataset/RiceLeafsDisease/train/healthy",
-#         "../data/rice-leaf-images/rice_images/_Healthy",
-#         "../data/rice-diseases-image-dataset/RiceDiseaseDataset/train/Healthy",
-#     ]}
-# }
-
 LABELS = {
-    0: {"name": "brown_spot", "match_substrings": [
-        "../data/new_data_field_rice/brown_spot"
-    ]},
-    1: {"name": "leaf_blast", "match_substrings": [
-        "../data/new_data_field_rice/leaf_blast"
-    ]},
-    2: {"name": "leaf_blight", "match_substrings": [
-        "../data/new_data_field_rice/leaf_blight"
-    ]},
-    3: {"name": "healthy", "match_substrings": [
-        "../data/new_data_field_rice/healthy",
-    ]}
+    0: {"name": "brown_spot", "match_substrings": ["../data/new_data_field_rice/brown_spot"]},
+    1: {"name": "leaf_blast", "match_substrings": ["../data/new_data_field_rice/leaf_blast"]},
+    2: {"name": "leaf_blight", "match_substrings": ["../data/new_data_field_rice/leaf_blight"]},
+    3: {"name": "healthy", "match_substrings": ["../data/new_data_field_rice/healthy"]}
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,7 +247,7 @@ class EnhancedHead(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        hidden = in_features // 2
+        hidden = max(256, in_features // 2)
         self.fc1 = nn.Sequential(
             nn.Linear(in_features * 2, hidden),
             nn.BatchNorm1d(hidden),
@@ -267,36 +264,60 @@ class EnhancedHead(nn.Module):
         x = self.fc2(x)
         return x
 
-# ===== ENHANCED MOBILENETV3 =====
-def build_enhanced_mobilenetv3(num_classes):
-    from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+# ===== BACKBONE BUILDER =====
+def build_backbone_and_channels(backbone_name):
+    from torchvision.models import (
+        mobilenet_v3_small, MobileNet_V3_Small_Weights,
+        efficientnet_v2_s, EfficientNet_V2_S_Weights
+    )
     
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    model = mobilenet_v3_small(weights=weights)
+    if backbone_name == 'mobilenetv3_small':
+        weights = MobileNet_V3_Small_Weights.DEFAULT
+        net = mobilenet_v3_small(weights=weights)
+        feat_channels = net.features[-1][0].out_channels
+        features = net.features
+        return net, features, feat_channels
     
+    elif backbone_name == 'efficientnet_v2_s':
+        weights = EfficientNet_V2_S_Weights.IMAGENET1K_V1
+        net = efficientnet_v2_s(weights=weights)
+        features = net.features
+        # Get output channels from last block
+        feat_channels = 1280  # EfficientNetV2-S final conv channels
+        return net, features, feat_channels
+    
+    else:
+        raise ValueError(f'Unknown backbone: {backbone_name}')
+
+def build_enhanced_classifier(num_classes):
+    base, features, C = build_backbone_and_channels(CONFIG['backbone'])
+    logging.info(f"Backbone: {CONFIG['backbone']} with {C} channels")
+    
+    # Add CBAM if enabled
     if CONFIG['use_cbam']:
-        in_channels = model.features[-1][0].out_channels
-        cbam = CBAM(in_channels, reduction=16)
-        original_features = model.features
-        model.features = nn.Sequential(*list(original_features.children()), cbam)
-        logging.info("✓ Added CBAM attention")
+        cbam = CBAM(C, reduction=16)
+        features = nn.Sequential(*list(features.children()), cbam)
+        logging.info("✓ CBAM attached")
+    
+    # Build model
+    model = nn.Module()
+    model.features = features
     
     if CONFIG['use_better_head']:
-        in_features = model.classifier[0].in_features
-        model.classifier = nn.Identity()
-        model.enhanced_head = EnhancedHead(in_features, num_classes, dropout=0.3)
-        
-        original_forward = model.forward
-        def new_forward(self, x):
-            x = self.features(x)
-            x = self.enhanced_head(x)
-            return x
-        model.forward = new_forward.__get__(model, type(model))
-        logging.info("✓ Added enhanced head")
+        model.head = EnhancedHead(C, num_classes, dropout=0.3)
+        logging.info("✓ Enhanced head")
     else:
-        in_features = model.classifier[3].in_features
-        model.classifier[3] = nn.Linear(in_features, num_classes)
+        model.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(C, num_classes)
+        )
     
+    def _forward(self, x):
+        x = self.features(x)
+        return self.head(x)
+    
+    model.forward = _forward.__get__(model, type(model))
     return model
 
 # %% [markdown]
@@ -350,19 +371,11 @@ collected_df = auto_collect_dataset()
 collected_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "collected_images.csv"), index=False)
 
 # %% [markdown]
-# ## PHASE 2: Prepare Dataset (Smart Labeling for Single Leaf vs Cluster)
+# ## PHASE 2: Prepare Dataset for YOLO (1-class LEAF only)
 
 # %%
 def detect_image_type(img_path, edge_threshold=0.15):
-    """
-    Detect if image is single leaf or rice plant cluster
-    
-    Strategy:
-    - Single leaf: Usually centered, edges are clear background
-    - Cluster/plant: Complex, multiple objects, edges have content
-    
-    Returns: 'single_leaf' or 'cluster'
-    """
+    """Detect if image is single leaf or cluster"""
     try:
         img = cv2.imread(img_path)
         if img is None:
@@ -371,19 +384,14 @@ def detect_image_type(img_path, edge_threshold=0.15):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # Check edge density (if edges have little content → single leaf)
-        edge_width = int(w * 0.1)  # 10% from each edge
+        edge_width = int(w * 0.1)
         edge_height = int(h * 0.1)
         
-        # Extract edge regions
         top_edge = gray[:edge_height, :]
         bottom_edge = gray[h-edge_height:, :]
         left_edge = gray[:, :edge_width]
         right_edge = gray[:, w-edge_width:]
         
-        # Calculate edge density using standard deviation
-        # Low std → uniform background → single leaf
-        # High std → complex content → cluster
         edge_std = np.mean([
             np.std(top_edge),
             np.std(bottom_edge),
@@ -393,7 +401,6 @@ def detect_image_type(img_path, edge_threshold=0.15):
         
         center_std = np.std(gray[edge_height:h-edge_height, edge_width:w-edge_width])
         
-        # If edge is much simpler than center → single leaf
         if center_std > 0:
             edge_ratio = edge_std / center_std
             if edge_ratio < edge_threshold:
@@ -405,17 +412,8 @@ def detect_image_type(img_path, edge_threshold=0.15):
         logging.warning(f"Error detecting type for {img_path}: {e}")
         return 'unknown'
 
-def create_pseudo_labels_for_cluster(img_path, label_id):
-    """
-    For cluster images, create pseudo bounding boxes using image processing
-    
-    Strategy:
-    1. Use color-based segmentation to find green regions (leaves)
-    2. Find contours and create bounding boxes
-    3. Filter small/noisy detections
-    
-    Returns: List of (class_id, x_center, y_center, width, height) normalized
-    """
+def create_pseudo_labels_for_cluster(img_path, class_id=0):
+    """Create pseudo bboxes for YOLO (class_id=0 for 'leaf')"""
     try:
         img = cv2.imread(img_path)
         if img is None:
@@ -424,25 +422,21 @@ def create_pseudo_labels_for_cluster(img_path, label_id):
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = img_rgb.shape[:2]
         
-        # Convert to HSV for better green detection
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
-        # Define range for green color (leaves)
         lower_green = np.array([25, 30, 30])
         upper_green = np.array([90, 255, 255])
         
         mask = cv2.inRange(hsv, lower_green, upper_green)
         
-        # Morphological operations to clean up
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         
-        # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         bboxes = []
-        min_area = (w * h) * 0.01  # At least 1% of image
+        min_area = (w * h) * 0.01
         
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -451,41 +445,31 @@ def create_pseudo_labels_for_cluster(img_path, label_id):
             
             x, y, box_w, box_h = cv2.boundingRect(contour)
             
-            # Skip very thin boxes (noise)
             aspect_ratio = box_w / box_h if box_h > 0 else 0
             if aspect_ratio < 0.1 or aspect_ratio > 10:
                 continue
             
-            # Normalize to YOLO format
             x_center = (x + box_w / 2) / w
             y_center = (y + box_h / 2) / h
             norm_w = box_w / w
             norm_h = box_h / h
             
-            bboxes.append((label_id, x_center, y_center, norm_w, norm_h))
+            bboxes.append((class_id, x_center, y_center, norm_w, norm_h))
         
-        # If no boxes found, fall back to full image
         if len(bboxes) == 0:
-            bboxes = [(label_id, 0.5, 0.5, 1.0, 1.0)]
+            bboxes = [(class_id, 0.5, 0.5, 1.0, 1.0)]
         
         return bboxes
         
     except Exception as e:
-        logging.warning(f"Error creating pseudo labels for {img_path}: {e}")
-        return [(label_id, 0.5, 0.5, 1.0, 1.0)]  # Fallback
+        logging.warning(f"Error creating pseudo labels: {e}")
+        return [(class_id, 0.5, 0.5, 1.0, 1.0)]
 
 def prepare_field_dataset(df, output_dir, val_size=0.15, test_size=0.15):
-    """
-    Prepare dataset with SMART LABELING:
-    - Single leaf images: Use full-image bbox (valid assumption)
-    - Cluster images: Use pseudo-labels from image processing
-    """
+    """Prepare dataset for YOLO - 1 class 'leaf' only"""
     logging.info("\n" + "="*60)
-    logging.info("SMART DATASET PREPARATION")
+    logging.info("DATASET PREPARATION FOR YOLO (1-CLASS LEAF)")
     logging.info("="*60)
-    logging.info("Strategy:")
-    logging.info("  • Single leaf images → Full-image bbox")
-    logging.info("  • Cluster images → Pseudo-labels from segmentation")
     
     trainval_df, test_df = train_test_split(
         df, test_size=test_size, random_state=42, stratify=df['label_id']
@@ -515,24 +499,22 @@ def prepare_field_dataset(df, output_dir, val_size=0.15, test_size=0.15):
             try:
                 shutil.copy2(src, dst)
                 
-                # Detect image type
                 img_type = detect_image_type(src)
                 type_stats[img_type] = type_stats.get(img_type, 0) + 1
                 
                 label_file = os.path.join(split_dir, f"{split}_{idx:06d}.txt")
                 
+                # YOLO labels: class_id=0 (leaf only)
                 if img_type == 'single_leaf':
-                    # Single leaf: Use full-image bbox (valid for centered single leaf)
                     with open(label_file, 'w') as f:
-                        f.write(f"{row['label_id']} 0.5 0.5 1.0 1.0\n")
+                        f.write("0 0.5 0.5 1.0 1.0\n")
                 else:
-                    # Cluster or unknown: Use pseudo-labels
-                    bboxes = create_pseudo_labels_for_cluster(src, row['label_id'])
+                    bboxes = create_pseudo_labels_for_cluster(src, class_id=0)
                     with open(label_file, 'w') as f:
-                        for bbox in bboxes:
-                            class_id, x_c, y_c, w, h = bbox
+                        for class_id, x_c, y_c, w, h in bboxes:
                             f.write(f"{class_id} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f}\n")
                 
+                # Keep disease label for later classification
                 field_data[split].append({
                     'image_path': dst,
                     'label_path': label_file,
@@ -545,32 +527,30 @@ def prepare_field_dataset(df, output_dir, val_size=0.15, test_size=0.15):
     
     logging.info(f"\n{'='*60}")
     logging.info("Image Type Statistics:")
-    logging.info(f"  Single Leaf: {type_stats.get('single_leaf', 0)} "
-                f"({type_stats.get('single_leaf', 0)/len(df)*100:.1f}%)")
-    logging.info(f"  Cluster:     {type_stats.get('cluster', 0)} "
-                f"({type_stats.get('cluster', 0)/len(df)*100:.1f}%)")
-    logging.info(f"  Unknown:     {type_stats.get('unknown', 0)} "
-                f"({type_stats.get('unknown', 0)/len(df)*100:.1f}%)")
+    for k, v in type_stats.items():
+        logging.info(f"  {k:15s}: {v:4d} ({v/len(df)*100:.1f}%)")
     logging.info(f"{'='*60}")
     
-    # Save statistics
     stats_df = pd.DataFrame([type_stats])
     stats_df.to_csv(os.path.join(output_dir, 'image_type_stats.csv'), index=False)
     
     return field_data
 
 def create_yolo_yaml(data_root, output_path):
+    """YOLO YAML for 1-class leaf detection"""
     import yaml
     yaml_data = {
         'path': str(Path(data_root).absolute()),
-        'train': 'train', 'val': 'val', 'test': 'test',
-        'nc': len(LABELS),
-        'names': [LABELS[i]['name'] for i in sorted(LABELS.keys())]
+        'train': 'train',
+        'val': 'val',
+        'test': 'test',
+        'nc': 1,
+        'names': ['leaf']
     }
     yaml_path = os.path.join(output_path, "data.yaml")
     with open(yaml_path, 'w') as f:
         yaml.dump(yaml_data, f, default_flow_style=False)
-    logging.info(f"Created data.yaml: {yaml_path}")
+    logging.info(f"Created YOLO YAML (1-class leaf): {yaml_path}")
     return yaml_path
 
 field_data = prepare_field_dataset(
@@ -580,7 +560,7 @@ field_data = prepare_field_dataset(
 yaml_path = create_yolo_yaml(OUTPUT_DIRS["field_images"], OUTPUT_DIRS["field_images"])
 
 # %% [markdown]
-# ## PHASE 3: YOLO Training
+# ## PHASE 3: YOLO Training (Leaf Detection)
 
 # %%
 def train_yolo_detector(yaml_path, output_dir, epochs=30, imgsz=640, batch=16):
@@ -589,7 +569,7 @@ def train_yolo_detector(yaml_path, output_dir, epochs=30, imgsz=640, batch=16):
         return None
     
     logging.info("\n" + "="*60)
-    logging.info("YOLO TRAINING")
+    logging.info("YOLO TRAINING (LEAF DETECTION)")
     logging.info("="*60)
     
     yolo_device = '0' if torch.cuda.is_available() else 'cpu'
@@ -611,11 +591,45 @@ best_yolo_model = train_yolo_detector(
 )
 
 # %% [markdown]
-# ## PHASE 4: Extract Crops with Visualization
+# ## PHASE 4: Extract Crops with Lesion-Aware Filtering
 
 # %%
+def lesion_score_rgb(crop_rgb: np.ndarray) -> float:
+    """
+    Score lesion presence in crop [0,1]
+    High score = likely diseased
+    """
+    if crop_rgb is None or crop_rgb.size == 0:
+        return 0.0
+    h, w = crop_rgb.shape[:2]
+    if h < CONFIG['min_crop_size'] or w < CONFIG['min_crop_size']:
+        return 0.0
+    
+    hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
+    
+    # Brown/yellow lesions
+    lower_brown = np.array([5, 40, 40])
+    upper_brown = np.array([30, 255, 220])
+    mask_brown = cv2.inRange(hsv, lower_brown, upper_brown)
+    
+    # Dark necrotic regions
+    lower_dark = np.array([0, 0, 0])
+    upper_dark = np.array([180, 255, 60])
+    mask_dark = cv2.inRange(hsv, lower_dark, upper_dark)
+    
+    lesion = cv2.bitwise_or(mask_brown, mask_dark)
+    lesion = cv2.morphologyEx(lesion, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+    lesion_ratio = lesion.mean() / 255.0
+    
+    # Texture variance
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    texture_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    texture_score = min(texture_var / 1000.0, 1.0)
+    
+    return float(0.7 * lesion_ratio + 0.3 * texture_score)
+
 def visualize_crop_samples(model, field_images, output_dir, n_samples=6):
-    """Visualize crop extraction: Original → Crops"""
+    """Visualize crop extraction with lesion scores"""
     logging.info("\n" + "="*60)
     logging.info("CREATING CROP VISUALIZATION SAMPLES")
     logging.info("="*60)
@@ -643,8 +657,6 @@ def visualize_crop_samples(model, field_images, output_dir, n_samples=6):
             for idx, result in enumerate(results[0].boxes):
                 x1, y1, x2, y2 = map(int, result.xyxy[0].cpu().numpy())
                 cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                cv2.putText(img_with_boxes, f"Crop {idx+1}", (x1, y1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 padding = 10
                 h, w = img_rgb.shape[:2]
@@ -655,7 +667,8 @@ def visualize_crop_samples(model, field_images, output_dir, n_samples=6):
                 
                 crop = img_rgb[y1_p:y2_p, x1_p:x2_p]
                 if crop.size > 0 and crop.shape[0] >= 50 and crop.shape[1] >= 50:
-                    crops.append(crop)
+                    score = lesion_score_rgb(crop)
+                    crops.append((crop, score))
             
             if len(crops) == 0:
                 continue
@@ -665,17 +678,17 @@ def visualize_crop_samples(model, field_images, output_dir, n_samples=6):
             
             ax = plt.subplot(2, 4, (1, 5))
             ax.imshow(img_with_boxes)
-            ax.set_title(f'Original Image (Label: {parent_label})\n{n_crops} crops detected', 
+            ax.set_title(f'Original (Label: {parent_label})\n{n_crops} crops detected', 
                         fontsize=12, fontweight='bold')
             ax.axis('off')
             
-            for i, crop in enumerate(crops[:6]):
+            for i, (crop, score) in enumerate(crops[:6]):
                 ax = plt.subplot(2, 4, i+2 if i < 3 else i+3)
                 ax.imshow(crop)
-                ax.set_title(f'Crop {i+1}\n(Inherited: {parent_label})', fontsize=10)
+                ax.set_title(f'Crop {i+1}\nLesion: {score:.3f}', fontsize=10)
                 ax.axis('off')
             
-            plt.suptitle(f'Sample {sample_idx+1}: Crop Extraction with Inheritance Labeling', 
+            plt.suptitle(f'Sample {sample_idx+1}: Lesion-Aware Crop Filtering', 
                         fontsize=14, fontweight='bold')
             plt.tight_layout()
             
@@ -683,20 +696,25 @@ def visualize_crop_samples(model, field_images, output_dir, n_samples=6):
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             plt.close()
             
-            logging.info(f"  ✓ Saved sample {sample_idx+1}: {n_crops} crops from {parent_label}")
+            logging.info(f"  ✓ Sample {sample_idx+1}: {n_crops} crops")
             
         except Exception as e:
             logging.warning(f"Error creating sample {sample_idx+1}: {e}")
 
-def extract_crops_with_inheritance_labeling(yolo_model_path, field_images, output_dir, confidence=0.25):
+def extract_crops_with_lesion_filtering(yolo_model_path, field_images, output_dir, confidence=0.25):
+    """
+    Extract crops and filter by lesion score to reduce label noise
+    - Diseased images: keep top-K lesion crops
+    - Healthy images: keep top-K low-lesion crops
+    """
     logging.info("\n" + "="*60)
-    logging.info("EXTRACTING CROPS WITH INHERITANCE LABELING")
+    logging.info("EXTRACTING CROPS WITH LESION-AWARE FILTERING")
     logging.info("="*60)
+    logging.info(f"Strategy: Keep top-{CONFIG['crops_per_image']} crops per image")
     
     model = YOLO(yolo_model_path)
     crops_data = []
     
-    # First, create visualization samples
     visualize_crop_samples(model, field_images, output_dir, n_samples=6)
     
     for split in ['train', 'val', 'test']:
@@ -719,24 +737,46 @@ def extract_crops_with_inheritance_labeling(yolo_model_path, field_images, outpu
                 results = model.predict(img_path, conf=confidence, verbose=False)
                 base_name = Path(img_path).stem
                 
-                for idx, result in enumerate(results[0].boxes):
+                # Collect all proposals with lesion scores
+                proposals = []
+                for result in results[0].boxes:
                     x1, y1, x2, y2 = map(int, result.xyxy[0].cpu().numpy())
                     
-                    padding = 10
-                    h, w = img_rgb.shape[:2]
-                    x1 = max(0, x1 - padding)
-                    y1 = max(0, y1 - padding)
-                    x2 = min(w, x2 + padding)
-                    y2 = min(h, y2 + padding)
+                    pad = 10
+                    H, W = img_rgb.shape[:2]
+                    x1 = max(0, x1 - pad)
+                    y1 = max(0, y1 - pad)
+                    x2 = min(W, x2 + pad)
+                    y2 = min(H, y2 + pad)
                     
                     crop = img_rgb[y1:y2, x1:x2]
+                    if crop.size == 0:
+                        continue
                     
-                    if crop.size == 0 or crop.shape[0] < 50 or crop.shape[1] < 50:
+                    score = lesion_score_rgb(crop)
+                    proposals.append((score, crop))
+                
+                if len(proposals) == 0:
+                    continue
+                
+                K = CONFIG['crops_per_image']
+                
+                # Filter by lesion score based on parent label
+                if parent_label_name == 'healthy':
+                    # Keep K crops with LOWEST lesion scores
+                    proposals = sorted(proposals, key=lambda x: x[0])[:K]
+                else:
+                    # Keep K crops with HIGHEST lesion scores
+                    proposals = sorted(proposals, key=lambda x: x[0], reverse=True)[:K]
+                
+                # Save filtered crops
+                for idx, (score, crop) in enumerate(proposals):
+                    if crop.shape[0] < CONFIG['min_crop_size'] or crop.shape[1] < CONFIG['min_crop_size']:
                         continue
                     
                     crop_filename = f"{base_name}_crop{idx:03d}.jpg"
                     crop_path = os.path.join(split_dir, crop_filename)
-                    Image.fromarray(crop).save(crop_path)
+                    Image.fromarray(crop).save(crop_path, quality=95)
                     
                     crops_data.append({
                         'crop_path': crop_path,
@@ -744,7 +784,7 @@ def extract_crops_with_inheritance_labeling(yolo_model_path, field_images, outpu
                         'split': split,
                         'label_id': parent_label_id,
                         'label_name': parent_label_name,
-                        'crop_id': f"{base_name}_crop{idx:03d}"
+                        'lesion_score': score
                     })
                     
             except Exception as e:
@@ -754,15 +794,19 @@ def extract_crops_with_inheritance_labeling(yolo_model_path, field_images, outpu
     crops_csv = os.path.join(output_dir, "crops_metadata.csv")
     crops_df.to_csv(crops_csv, index=False)
     
-    logging.info(f"\n✓ Extracted {len(crops_df)} crops with inherited labels")
+    logging.info(f"\n✓ Extracted {len(crops_df)} filtered crops")
     for split in ['train', 'val', 'test']:
         count = len(crops_df[crops_df['split']==split])
         logging.info(f"  {split}: {count}")
     logging.info(f"\nLabel distribution:\n{crops_df.groupby(['split', 'label_name']).size()}")
+    logging.info(f"\nLesion score stats by label:")
+    for label in crops_df['label_name'].unique():
+        scores = crops_df[crops_df['label_name']==label]['lesion_score']
+        logging.info(f"  {label:15s}: mean={scores.mean():.3f}, std={scores.std():.3f}")
     
     return crops_df
 
-crops_df = extract_crops_with_inheritance_labeling(
+crops_df = extract_crops_with_lesion_filtering(
     yolo_model_path=best_yolo_model,
     field_images=field_data,
     output_dir=OUTPUT_DIRS["crops"],
@@ -770,7 +814,7 @@ crops_df = extract_crops_with_inheritance_labeling(
 )
 
 # %% [markdown]
-# ## PHASE 5: Data Analysis Report
+# ## PHASE 5: Data Analysis Report (KEEP ALL CHARTS)
 
 # %%
 def create_data_analysis_report(collected_df, crops_df, output_dir):
@@ -794,7 +838,7 @@ def create_data_analysis_report(collected_df, crops_df, output_dir):
     crop_counts = crops_df.groupby('label_name').size().sort_values(ascending=True)
     crop_counts.plot(kind='barh', ax=ax2, color=colors)
     ax2.set_xlabel('Number of Crops', fontsize=10)
-    ax2.set_title('Extracted Crops per Disease Class', fontsize=11, fontweight='bold')
+    ax2.set_title('Filtered Crops per Disease Class', fontsize=11, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='x')
     
     # 3. Crops per split
@@ -826,22 +870,27 @@ def create_data_analysis_report(collected_df, crops_df, output_dir):
            colors=colors, startangle=90)
     ax5.set_title('Overall Crop Distribution', fontsize=11, fontweight='bold')
     
-    # 6. Train/Val/Test ratio
+    # 6. Lesion score distribution
     ax6 = plt.subplot(3, 3, 6)
-    split_pct = crops_df.groupby('split').size() / len(crops_df) * 100
-    ax6.pie(split_pct.values, labels=[f'{s}\n({v:.1f}%)' for s, v in split_pct.items()],
-           colors=split_colors, startangle=90)
-    ax6.set_title('Train/Val/Test Split Ratio', fontsize=11, fontweight='bold')
+    for label in crops_df['label_name'].unique():
+        scores = crops_df[crops_df['label_name']==label]['lesion_score']
+        ax6.hist(scores, bins=20, alpha=0.6, label=label)
+    ax6.set_xlabel('Lesion Score', fontsize=10)
+    ax6.set_ylabel('Frequency', fontsize=10)
+    ax6.set_title('Lesion Score Distribution by Class', fontsize=11, fontweight='bold')
+    ax6.legend()
+    ax6.grid(True, alpha=0.3)
     
     # 7. Crops per parent image stats
     ax7 = plt.subplot(3, 3, 7)
     crops_per_parent = crops_df.groupby('parent_image').size()
-    ax7.hist(crops_per_parent.values, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+    ax7.hist(crops_per_parent.values, bins=range(1, max(crops_per_parent.values)+2), 
+            color='steelblue', alpha=0.7, edgecolor='black')
     ax7.axvline(crops_per_parent.mean(), color='red', linestyle='--', linewidth=2, 
                label=f'Mean: {crops_per_parent.mean():.1f}')
     ax7.set_xlabel('Crops per Parent Image', fontsize=10)
     ax7.set_ylabel('Frequency', fontsize=10)
-    ax7.set_title('Crops Extracted per Parent Image', fontsize=11, fontweight='bold')
+    ax7.set_title('Filtered Crops per Parent Image', fontsize=11, fontweight='bold')
     ax7.legend()
     ax7.grid(True, alpha=0.3, axis='y')
     
@@ -882,15 +931,14 @@ def create_data_analysis_report(collected_df, crops_df, output_dir):
       • Test:  {len(crops_df[crops_df['split']=='test']):,} ({len(crops_df[crops_df['split']=='test'])/len(crops_df)*100:.1f}%)
     
     Avg Crops/Image: {crops_per_parent.mean():.2f}
-    Min: {crops_per_parent.min()}
-    Max: {crops_per_parent.max()}
     
-    Enhancements:
-      CBAM: {CONFIG['use_cbam']}
-      Enhanced Head: {CONFIG['use_better_head']}
-      CutMix: {CONFIG['use_cutmix']}
-      Progressive: {CONFIG['use_progressive_resize']}
-      TTA: {CONFIG['use_tta']}
+    Optimizations:
+      ✓ YOLO 1-class (leaf)
+      ✓ Lesion-aware filtering
+      ✓ {CONFIG['backbone']}
+      ✓ SCE Loss + EMA
+      ✓ Weighted Sampler
+      ✓ Logit Adjustment
     """
     ax9.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
             verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
@@ -907,69 +955,53 @@ def create_data_analysis_report(collected_df, crops_df, output_dir):
 create_data_analysis_report(collected_df, crops_df, OUTPUT_DIRS["plots"])
 
 # %% [markdown]
-# ## PHASE 6: Enhanced Training Components
+# ## PHASE 6: Robust Training Components
 
 # %%
-# ===== CUTMIX =====
-def cutmix(images, labels, alpha=1.0):
-    batch_size = images.size(0)
-    indices = torch.randperm(batch_size, device=images.device)
-    shuffled_images = images[indices]
-    shuffled_labels = labels[indices]
-    
-    lam = np.random.beta(alpha, alpha)
-    
-    _, _, h, w = images.size()
-    cut_rat = np.sqrt(1.0 - lam)
-    cut_w = int(w * cut_rat)
-    cut_h = int(h * cut_rat)
-    
-    cx = np.random.randint(w)
-    cy = np.random.randint(h)
-    
-    bbx1 = np.clip(cx - cut_w // 2, 0, w)
-    bby1 = np.clip(cy - cut_h // 2, 0, h)
-    bbx2 = np.clip(cx + cut_w // 2, 0, w)
-    bby2 = np.clip(cy + cut_h // 2, 0, h)
-    
-    images[:, :, bby1:bby2, bbx1:bbx2] = shuffled_images[:, :, bby1:bby2, bbx1:bbx2]
-    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (w * h))
-    
-    return images, labels, shuffled_labels, lam
-
-# ===== MIXUP =====
-class MixUpDataset(Dataset):
-    def __init__(self, base_dataset, alpha=0.2):
-        self.dataset = base_dataset
-        self.alpha = alpha
-    
-    def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        img1, label1 = self.dataset[idx]
-        
-        if random.random() < 0.5:
-            idx2 = random.randint(0, len(self.dataset) - 1)
-            img2, label2 = self.dataset[idx2]
-            lam = np.random.beta(self.alpha, self.alpha)
-            mixed_img = lam * img1 + (1 - lam) * img2
-            return mixed_img, label1, label2, lam
-        else:
-            return img1, label1, label1, 1.0
-
-# ===== LABEL SMOOTHING =====
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, epsilon=0.1):
+# ===== SYMMETRIC CROSS-ENTROPY =====
+class SymmetricCrossEntropy(nn.Module):
+    def __init__(self, alpha=0.1, beta=1.0, num_classes=4):
         super().__init__()
-        self.epsilon = epsilon
+        self.alpha = alpha
+        self.beta = beta
+        self.num_classes = num_classes
     
-    def forward(self, pred, target):
-        n_classes = pred.size(-1)
-        log_preds = F.log_softmax(pred, dim=-1)
-        loss = -log_preds.sum(dim=-1).mean()
-        nll = F.nll_loss(log_preds, target)
-        return (1 - self.epsilon) * nll + self.epsilon * (loss / n_classes)
+    def forward(self, logits, targets):
+        # Standard CE
+        ce = F.cross_entropy(logits, targets)
+        
+        # Reverse CE
+        pred = F.softmax(logits, dim=1).clamp(min=1e-7, max=1-1e-7)
+        onehot = F.one_hot(targets, self.num_classes).float()
+        rce = (-torch.sum(onehot * torch.log(pred), dim=1)).mean()
+        
+        return self.alpha * ce + self.beta * rce
+
+# ===== LOGIT ADJUSTMENT =====
+def compute_priors(df, n_classes):
+    counts = df['label_id'].value_counts().sort_index().values.astype(float)
+    priors = torch.tensor(counts / counts.sum(), dtype=torch.float32)
+    return priors
+
+def apply_logit_adjustment(logits, priors, tau=1.0):
+    return logits + tau * torch.log(priors.to(logits.device))
+
+# ===== EMA =====
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        self.ema = deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+    
+    @torch.no_grad()
+    def update(self, model):
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(self.decay).add_(msd[k].detach(), alpha=1 - self.decay)
+            else:
+                v.copy_(msd[k])
 
 # ===== DATASET =====
 class CropDataset(Dataset):
@@ -988,27 +1020,49 @@ class CropDataset(Dataset):
             img = self.transform(img)
         return img, label
 
-# ===== PROGRESSIVE TRANSFORMS =====
+# ===== TRANSFORMS =====
 def get_transforms(size):
     train_transform = transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomResizedCrop(size, scale=(0.7, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.TrivialAugmentWide(num_magnitude_bins=31),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
     val_transform = transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
     return train_transform, val_transform
 
+# ===== DATA LOADERS =====
+def make_loader(df, transform, batch_size, train=True):
+    dataset = CropDataset(df, transform=transform)
+    
+    if train and CONFIG['use_weighted_sampler']:
+        counts = df['label_id'].value_counts().sort_index().values.astype(float)
+        class_weights = 1.0 / (counts + 1e-6)
+        sample_weights = df['label_id'].map({i:w for i,w in enumerate(class_weights)}).values
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        loader = DataLoader(
+            dataset, batch_size=batch_size, sampler=sampler,
+            num_workers=CONFIG['num_workers'], pin_memory=CONFIG['pin_memory'],
+            persistent_workers=CONFIG['persistent_workers']
+        )
+    else:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=train,
+            num_workers=CONFIG['num_workers'], pin_memory=CONFIG['pin_memory'],
+            persistent_workers=CONFIG['persistent_workers']
+        )
+    
+    return loader
+
 # %% [markdown]
-# ## PHASE 7: Training
+# ## PHASE 7: Optimized Training
 
 # %%
 def setup_amp():
@@ -1027,10 +1081,19 @@ def setup_amp():
     else:
         scaler = GradScaler(enabled=use_cuda)
     
-    # Clear GPU cache to start fresh
+    # Clear GPU cache and optimize memory
     if use_cuda:
-        torch.cuda.empty_cache()
+        # Set memory allocator to avoid fragmentation
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        
+        # Aggressive cleanup
+        cleanup_memory()
+        
+        # Reset memory stats
+        torch.cuda.reset_peak_memory_stats()
+        
         logging.info(f"GPU Memory before training: {torch.cuda.memory_allocated()/1024**3:.2f}GB / {torch.cuda.memory_reserved()/1024**3:.2f}GB")
+        logging.info(f"Max memory to use: {CONFIG.get('max_memory_allocated', 15.0):.1f}GB (leaving 7GB buffer for system)")
     
     return DEVICE, amp_ctx, scaler
 
@@ -1050,248 +1113,195 @@ def log_gpu_memory(epoch=None, step=None):
             prefix += ": "
             
         logging.info(f"{prefix}GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB, Max: {max_mem:.2f}GB")
+        
+        # Warning if memory usage is high
+        if allocated > CONFIG.get('max_memory_allocated', 15.0):
+            logging.warning(f"High GPU memory usage: {allocated:.2f}GB > {CONFIG.get('max_memory_allocated', 15.0)}GB")
 
-def train_enhanced_model(model, train_df, val_df, epochs):
+def cleanup_memory():
+    """Aggressive memory cleanup"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+def check_memory_and_cleanup(batch_idx):
+    """Check memory usage and cleanup if needed"""
+    if torch.cuda.is_available() and batch_idx > 0:
+        if batch_idx % CONFIG.get('memory_cleanup_frequency', 3) == 0:
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            if allocated > CONFIG.get('max_memory_allocated', 15.0) * 0.8:  # 80% threshold
+                cleanup_memory()
+                logging.info(f"Memory cleanup at batch {batch_idx}, was {allocated:.2f}GB")
+
+def train_optimized_model(model, train_df, val_df, epochs):
     device, amp_ctx, scaler = setup_amp()
     model = model.to(device)
     
-    if CONFIG['use_label_smoothing']:
-        criterion = LabelSmoothingCrossEntropy(CONFIG['label_smooth_eps'])
-        logging.info("Using Label Smoothing")
+    num_classes = len(LABELS)
+    priors = compute_priors(train_df, num_classes)
+    logging.info(f"Class priors: {priors.tolist()}")
+    
+    # Loss
+    if CONFIG['use_sce_loss']:
+        criterion = SymmetricCrossEntropy(CONFIG['sce_alpha'], CONFIG['sce_beta'], num_classes)
+        logging.info("✓ Using Symmetric Cross-Entropy")
     else:
         criterion = nn.CrossEntropyLoss()
     
+    # Optimizer & Scheduler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
+    # EMA
+    ema = ModelEMA(model, decay=CONFIG['ema_decay']) if CONFIG['use_ema'] else None
+    if ema:
+        logging.info("✓ Using EMA")
+    
     best_val_acc = 0.0
+    patience = 10
+    bad_epochs = 0
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    best_path = os.path.join(OUTPUT_DIRS["weights"], "enhanced_mobilenetv3_best.pth")
+    best_path = os.path.join(OUTPUT_DIRS["weights"], "best_classifier.pth")
     
     current_size = CONFIG['img_size']
     
-    logging.info(f"\nTraining Enhanced MobileNetV3-Small...")
-    logging.info(f"Enhancements: CBAM={CONFIG['use_cbam']}, Head={CONFIG['use_better_head']}, "
-                f"CutMix={CONFIG['use_cutmix']}, Progressive={CONFIG['use_progressive_resize']}")
+    logging.info(f"\nTraining {CONFIG['backbone']}...")
+    logging.info(f"Enhancements: CBAM={CONFIG['use_cbam']}, EnhancedHead={CONFIG['use_better_head']}")
+    logging.info(f"Robust: SCE={CONFIG['use_sce_loss']}, WeightedSampler={CONFIG['use_weighted_sampler']}, EMA={CONFIG['use_ema']}")
     
     for epoch in range(1, epochs + 1):
-        # Progressive resizing
-        if CONFIG['use_progressive_resize']:
-            if epoch in CONFIG['progressive_schedule']:
-                current_size = CONFIG['progressive_schedule'][epoch]
+        # Progressive resize with memory check
+        if CONFIG['use_progressive_resize'] and epoch in CONFIG['progressive_schedule']:
+            new_size = CONFIG['progressive_schedule'][epoch]
+            
+            # Check if we can afford larger images
+            current_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+            if new_size > current_size and current_mem > CONFIG.get('max_memory_allocated', 15.0) * 0.6:  # 60% threshold
+                logging.warning(f"Skipping resize to {new_size} due to memory constraints ({current_mem:.1f}GB)")
+            else:
+                current_size = new_size
                 logging.info(f"\n→ Progressive resize to {current_size}x{current_size}")
+                # Cleanup after resize change
+                cleanup_memory()
         
-        # Check if we should disable strong augmentation for fine-tuning
-        use_strong_aug = epoch <= int(0.8 * epochs)
-        if epoch == int(0.8 * epochs) + 1:
-            logging.info(f"\n→ Disabling MixUp/CutMix for fine-tuning (epoch {epoch}/{epochs})")
-        
-        # Update transforms and loaders
+        # Prepare loaders
         train_transform, val_transform = get_transforms(current_size)
+        train_loader = make_loader(train_df, train_transform, CONFIG['batch_size'], train=True)
+        val_loader = make_loader(val_df, val_transform, CONFIG['batch_size'], train=False)
         
-        if CONFIG['use_mixup']:
-            train_dataset_base = CropDataset(train_df, transform=train_transform)
-            train_dataset = MixUpDataset(train_dataset_base, alpha=CONFIG['mixup_alpha'])
-        else:
-            train_dataset = CropDataset(train_df, transform=train_transform)
-        
-        val_dataset = CropDataset(val_df, transform=val_transform)
-        
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=CONFIG['batch_size'], 
-            shuffle=True, 
-            num_workers=CONFIG['num_workers'], 
-            pin_memory=CONFIG['pin_memory'],
-            persistent_workers=CONFIG['persistent_workers'],
-            prefetch_factor=CONFIG['prefetch_factor']
-        )
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=CONFIG['batch_size'], 
-            shuffle=False, 
-            num_workers=CONFIG['num_workers'], 
-            pin_memory=CONFIG['pin_memory'],
-            persistent_workers=CONFIG['persistent_workers'],
-            prefetch_factor=CONFIG['prefetch_factor']
-        )
-        
-        # Train
+        # ===== TRAIN =====
         model.train()
-        train_loss, train_correct, train_total = 0.0, 0, 0
+        epoch_loss, correct, total = 0.0, 0, 0
         
         # Gradient accumulation setup
         accumulation_steps = CONFIG['gradient_accumulation_steps']
         effective_batch_size = CONFIG['batch_size'] * accumulation_steps
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} (BS:{effective_batch_size})")
-        for batch_idx, batch in enumerate(pbar):
-            # Check if we should use strong augmentation (disable in last 20% of epochs)
-            use_strong_aug = epoch <= int(0.8 * epochs)
-            enable_mixup = CONFIG['use_mixup'] and use_strong_aug
-            enable_cutmix = CONFIG['use_cutmix'] and use_strong_aug
+        for batch_idx, (imgs, labels) in enumerate(pbar):
+            imgs = imgs.to(device)
+            labels = labels.long().to(device)
             
-            if enable_mixup and len(batch) == 4:  # MixUp
-                imgs, labels1, labels2, lam = batch
-                imgs = imgs.to(device)
-                labels1 = labels1.long().to(device)
-                labels2 = labels2.long().to(device)
-                
-                # lam should be tensor per batch [B] for per-sample mixing
-                if not torch.is_tensor(lam):
-                    lam = torch.tensor(lam)
-                lam = lam.to(device).float()  # [B]
-                lam = lam.view(-1, 1)         # [B,1] for broadcasting
-                
-                # Random: use MixUp or CutMix
-                if enable_cutmix and random.random() < 0.5:
-                    imgs, labels1, labels2, lam_cutmix = cutmix(imgs, labels1, CONFIG['cutmix_alpha'])
-                    # CutMix returns scalar lam, convert to per-sample
-                    lam = torch.full((imgs.size(0), 1), float(lam_cutmix), device=device)
-                
-                # Only zero gradients at the start of accumulation
-                if batch_idx % accumulation_steps == 0:
-                    optimizer.zero_grad()
-                
-                with amp_ctx:
-                    outputs = model(imgs)
-                    # Per-sample loss calculation
-                    if CONFIG['use_label_smoothing']:
-                        # For label smoothing, we need per-sample loss
-                        loss1 = F.cross_entropy(outputs, labels1, reduction='none')  # [B]
-                        loss2 = F.cross_entropy(outputs, labels2, reduction='none')  # [B]
-                        loss = (lam.squeeze(1) * loss1 + (1-lam.squeeze(1)) * loss2).mean()
-                    else:
-                        loss1 = F.cross_entropy(outputs, labels1, reduction='none')  # [B]
-                        loss2 = F.cross_entropy(outputs, labels2, reduction='none')  # [B]
-                        loss = (lam.squeeze(1) * loss1 + (1-lam.squeeze(1)) * loss2).mean()
+            # Only zero gradients at start of accumulation
+            if batch_idx % accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+            
+            with amp_ctx:
+                logits = model(imgs)
+                if CONFIG['use_logit_adjustment']:
+                    logits = apply_logit_adjustment(logits, priors, CONFIG['logit_adjustment_tau'])
+                loss = criterion(logits, labels)
                 
                 # Scale loss by accumulation steps
                 loss = loss / accumulation_steps
-                
-                scaler.scale(loss).backward()
-                
-                # Only step optimizer every accumulation_steps
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                
-                train_loss += loss.item() * imgs.size(0)
-                # Per-sample accuracy estimation
-                pred = outputs.argmax(1)
-                train_correct += (lam.squeeze(1) * (pred == labels1).float() + 
-                                (1-lam.squeeze(1)) * (pred == labels2).float()).sum().item()
-                train_total += imgs.size(0)
-            else:
-                imgs, labels = batch if len(batch) == 2 else (batch[0], batch[1])
-                imgs = imgs.to(device)
-                labels = labels.long().to(device)
-                
-                # Apply CutMix randomly (only if strong augmentation enabled)
-                if enable_cutmix and random.random() < 0.5:
-                    imgs, labels_a, labels_b, lam = cutmix(imgs, labels, CONFIG['cutmix_alpha'])
-                    lam = torch.tensor(float(lam), device=device, dtype=torch.float32)
-                    
-                    # Only zero gradients at the start of accumulation
-                    if batch_idx % accumulation_steps == 0:
-                        optimizer.zero_grad()
-                    
-                    with amp_ctx:
-                        outputs = model(imgs)
-                        # Use consistent loss function
-                        if CONFIG['use_label_smoothing']:
-                            loss1 = F.cross_entropy(outputs, labels_a, reduction='none')
-                            loss2 = F.cross_entropy(outputs, labels_b, reduction='none')
-                            loss = (lam * loss1 + (1-lam) * loss2).mean()
-                        else:
-                            loss1 = F.cross_entropy(outputs, labels_a, reduction='none')
-                            loss2 = F.cross_entropy(outputs, labels_b, reduction='none')
-                            loss = (lam * loss1 + (1-lam) * loss2).mean()
-                    
-                    # Scale loss by accumulation steps
-                    loss = loss / accumulation_steps
-                    
-                    scaler.scale(loss).backward()
-                    
-                    # Only step optimizer every accumulation_steps
-                    if (batch_idx + 1) % accumulation_steps == 0:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                    
-                    train_loss += loss.item() * imgs.size(0)
-                    train_correct += (lam * (outputs.argmax(1) == labels_a).float() + 
-                                    (1-lam) * (outputs.argmax(1) == labels_b).float()).sum().item()
-                    train_total += imgs.size(0)
-                else:
-                    # Only zero gradients at the start of accumulation
-                    if batch_idx % accumulation_steps == 0:
-                        optimizer.zero_grad()
-                        
-                    with amp_ctx:
-                        outputs = model(imgs)
-                        loss = criterion(outputs, labels)
-                    
-                    # Scale loss by accumulation steps
-                    loss = loss / accumulation_steps
-                    
-                    scaler.scale(loss).backward()
-                    
-                    # Only step optimizer every accumulation_steps
-                    if (batch_idx + 1) % accumulation_steps == 0:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                    
-                    train_loss += loss.item() * imgs.size(0)
-                    train_correct += (outputs.argmax(1) == labels).sum().item()
-                    train_total += imgs.size(0)
             
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            scaler.scale(loss).backward()
+            
+            # Only step optimizer every accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                
+                if ema is not None:
+                    ema.update(model)
+                    
+                optimizer.zero_grad(set_to_none=True)
+            
+            # Track metrics (remember to scale back loss for reporting)
+            epoch_loss += (loss.item() * accumulation_steps) * imgs.size(0)
+            pred = logits.argmax(1)
+            correct += (pred == labels).sum().item()
+            total += imgs.size(0)
+            
+            # Update progress bar with memory info
+            current_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+            pbar.set_postfix({
+                'loss': f'{loss.item() * accumulation_steps:.4f}', 
+                'mem': f'{current_mem:.1f}GB'
+            })
+            
+            # Periodic memory cleanup
+            check_memory_and_cleanup(batch_idx)
         
-        # Validation
-        model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
+        train_loss = epoch_loss / total
+        train_acc = correct / total
+        
+        # ===== VALIDATE =====
+        eval_model = ema.ema if (ema is not None) else model
+        eval_model.eval()
+        vloss, vcorrect, vtotal = 0.0, 0, 0
         
         with torch.no_grad():
             for imgs, labels in val_loader:
                 imgs = imgs.to(device)
                 labels = labels.long().to(device)
+                
                 with amp_ctx:
-                    outputs = model(imgs)
-                    # Use standard cross-entropy for validation (no augmentation)
-                    loss = F.cross_entropy(outputs, labels)
-                val_loss += loss.item() * imgs.size(0)
-                val_correct += (outputs.argmax(1) == labels).sum().item()
-                val_total += imgs.size(0)
+                    logits = eval_model(imgs)
+                    if CONFIG['use_logit_adjustment']:
+                        logits = apply_logit_adjustment(logits, priors, CONFIG['logit_adjustment_tau'])
+                    loss = F.cross_entropy(logits, labels)
+                
+                vloss += loss.item() * imgs.size(0)
+                vcorrect += (logits.argmax(1) == labels).sum().item()
+                vtotal += imgs.size(0)
         
-        train_loss /= train_total
-        train_acc = train_correct / train_total
-        val_loss /= val_total
-        val_acc = val_correct / val_total
+        val_loss = vloss / vtotal
+        val_acc = vcorrect / vtotal
         
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
         
-        logging.info(f"Epoch {epoch}: TL={train_loss:.4f} TA={train_acc:.4f} VL={val_loss:.4f} VA={val_acc:.4f}")
+        scheduler.step()
         
-        # Log GPU memory usage
+        logging.info(f"Epoch {epoch}: TL={train_loss:.4f} TA={train_acc:.4f} | VL={val_loss:.4f} VA={val_acc:.4f}")
+        
+        # Log GPU memory usage periodically
         if epoch % 5 == 0 or epoch == 1:
             log_gpu_memory(epoch=epoch)
             
-        # Clean up GPU memory periodically
-        if epoch % 10 == 0:
-            torch.cuda.empty_cache()
+        # Aggressive memory cleanup
+        cleanup_memory()  # Clean after every epoch
         
-        scheduler.step()
+        # Extra cleanup for safety
+        if epoch % 3 == 0:
+            torch.cuda.synchronize()
+            gc.collect()
         
+        # Early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), best_path)
-            logging.info(f"  → Best model saved (Val Acc: {val_acc:.4f})")
+            bad_epochs = 0
+            torch.save(eval_model.state_dict(), best_path)
+            logging.info(f"  → Saved best (Val Acc {val_acc:.4f})")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                logging.info("Early stopping triggered")
+                break
     
     return history, best_path
 
@@ -1299,11 +1309,11 @@ def train_enhanced_model(model, train_df, val_df, epochs):
 train_crops = crops_df[crops_df['split'] == 'train']
 val_crops = crops_df[crops_df['split'] == 'val']
 
-model = build_enhanced_mobilenetv3(len(LABELS))
-history, best_checkpoint = train_enhanced_model(model, train_crops, val_crops, CONFIG['epochs'])
+model = build_enhanced_classifier(len(LABELS))
+history, best_checkpoint = train_optimized_model(model, train_crops, val_crops, CONFIG['epochs'])
 
 # %% [markdown]
-# ## PHASE 8: Training Report
+# ## PHASE 8: Training Report (KEEP ALL CHARTS)
 
 # %%
 def create_training_report(history, model_name, output_dir):
@@ -1410,11 +1420,11 @@ def create_training_report(history, model_name, output_dir):
       Val Loss:   {history['val_loss'][-1]:.4f}
       Val Acc:    {history['val_acc'][-1]:.4f}
     
-    Enhancements:
-      CBAM: {CONFIG['use_cbam']}
-      Enhanced Head: {CONFIG['use_better_head']}
-      CutMix: {CONFIG['use_cutmix']}
-      Progressive: {CONFIG['use_progressive_resize']}
+    Optimizations:
+      Backbone: {CONFIG['backbone']}
+      SCE Loss: {CONFIG['use_sce_loss']}
+      EMA: {CONFIG['use_ema']}
+      Weighted Sampler: {CONFIG['use_weighted_sampler']}
     """
     ax7.text(0.1, 0.5, metrics_text, fontsize=9, family='monospace',
             verticalalignment='center', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
@@ -1453,7 +1463,7 @@ def create_training_report(history, model_name, output_dir):
     
     logging.info(f"✓ Training report saved: {save_path}")
 
-create_training_report(history, "Enhanced_MobileNetV3_Small", OUTPUT_DIRS["plots"])
+create_training_report(history, f"Optimized_{CONFIG['backbone']}", OUTPUT_DIRS["plots"])
 
 # %% [markdown]
 # ## PHASE 9: Test with TTA
@@ -1464,7 +1474,6 @@ def test_with_tta(model, test_df, device):
     model = model.to(device)
     model.eval()
     
-    # TTA transforms
     tta_transforms = [
         transforms.Compose([
             transforms.Resize((CONFIG['img_size'], CONFIG['img_size'])),
@@ -1474,6 +1483,12 @@ def test_with_tta(model, test_df, device):
         transforms.Compose([
             transforms.Resize((CONFIG['img_size'], CONFIG['img_size'])),
             transforms.RandomHorizontalFlip(p=1.0),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((CONFIG['img_size'], CONFIG['img_size'])),
+            transforms.RandomVerticalFlip(p=1.0),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
@@ -1489,12 +1504,6 @@ def test_with_tta(model, test_df, device):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
-        transforms.Compose([
-            transforms.Resize((CONFIG['img_size'], CONFIG['img_size'])),
-            transforms.RandomRotation((270, 270)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
     ]
     
     all_preds, all_labels = [], []
@@ -1504,7 +1513,6 @@ def test_with_tta(model, test_df, device):
             img = Image.open(row["crop_path"]).convert("RGB")
             label = int(row["label_id"])
             
-            # Apply TTA
             outputs_list = []
             for transform in tta_transforms[:CONFIG['tta_transforms']]:
                 img_tensor = transform(img).unsqueeze(0).to(device)
@@ -1512,7 +1520,6 @@ def test_with_tta(model, test_df, device):
                 probs = F.softmax(output, dim=1)
                 outputs_list.append(probs)
             
-            # Average predictions
             avg_probs = torch.stack(outputs_list).mean(0)
             pred = avg_probs.argmax(1)
             
@@ -1532,24 +1539,14 @@ def test_with_tta(model, test_df, device):
 # Test
 test_crops = crops_df[crops_df['split'] == 'test']
 model.load_state_dict(torch.load(best_checkpoint, map_location=DEVICE))
-model = model.to(DEVICE)  # Ensure model is on correct device
+model = model.to(DEVICE)
 
 if CONFIG['use_tta']:
     logging.info(f"\nTesting with TTA ({CONFIG['tta_transforms']} augmentations)")
     test_metrics = test_with_tta(model, test_crops, DEVICE)
 else:
-    # Standard test
     _, val_transform = get_transforms(CONFIG['img_size'])
-    test_dataset = CropDataset(test_crops, transform=val_transform)
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=CONFIG['batch_size'], 
-        shuffle=False, 
-        num_workers=CONFIG['num_workers'], 
-        pin_memory=CONFIG['pin_memory'],
-        persistent_workers=CONFIG['persistent_workers'],
-        prefetch_factor=CONFIG['prefetch_factor']
-    )
+    test_loader = make_loader(test_crops, val_transform, CONFIG['batch_size'], train=False)
     
     model.eval()
     all_preds, all_labels = [], []
@@ -1579,7 +1576,7 @@ logging.info(f"Recall:    {test_metrics['recall']:.4f}")
 logging.info(f"F1 Score:  {test_metrics['f1']:.4f}")
 
 # %% [markdown]
-# ## PHASE 10: Test Results Report
+# ## PHASE 10: Test Results Report (KEEP ALL CHARTS)
 
 # %%
 def create_test_results_report(test_metrics, class_names, output_dir):
@@ -1689,10 +1686,10 @@ def create_test_results_report(test_metrics, class_names, output_dir):
     Best Class:  {class_names[np.argmax(class_accuracies)]} ({max(class_accuracies):.1%})
     Worst Class: {class_names[np.argmin(class_accuracies)]} ({min(class_accuracies):.1%})
     
-    Enhancements Used:
-      CBAM: {CONFIG['use_cbam']}
-      Enhanced Head: {CONFIG['use_better_head']}
-      CutMix: {CONFIG['use_cutmix']}
+    Optimizations:
+      Backbone: {CONFIG['backbone']}
+      SCE Loss: {CONFIG['use_sce_loss']}
+      EMA: {CONFIG['use_ema']}
       TTA: {CONFIG['use_tta']} ({CONFIG['tta_transforms']} aug)
     """
     
@@ -1716,14 +1713,17 @@ report = classification_report(test_metrics['y_true'], test_metrics['y_pred'],
                                target_names=class_names, digits=4)
 report_path = os.path.join(OUTPUT_DIRS["results"], 'test_classification_report.txt')
 with open(report_path, 'w') as f:
-    f.write("Enhanced MobileNetV3-Small Test Results\n")
+    f.write(f"Optimized {CONFIG['backbone']} Test Results\n")
     f.write("="*60 + "\n\n")
     f.write(f"Test Accuracy: {test_metrics['accuracy']:.4f}\n\n")
-    f.write("Enhancements:\n")
-    f.write(f"  CBAM: {CONFIG['use_cbam']}\n")
-    f.write(f"  Enhanced Head: {CONFIG['use_better_head']}\n")
-    f.write(f"  CutMix: {CONFIG['use_cutmix']}\n")
-    f.write(f"  Progressive Resize: {CONFIG['use_progressive_resize']}\n")
+    f.write("Optimizations:\n")
+    f.write(f"  Backbone: {CONFIG['backbone']}\n")
+    f.write(f"  YOLO: 1-class leaf\n")
+    f.write(f"  Lesion filtering: Top-{CONFIG['crops_per_image']} per image\n")
+    f.write(f"  SCE Loss: {CONFIG['use_sce_loss']}\n")
+    f.write(f"  Weighted Sampler: {CONFIG['use_weighted_sampler']}\n")
+    f.write(f"  Logit Adjustment: {CONFIG['use_logit_adjustment']}\n")
+    f.write(f"  EMA: {CONFIG['use_ema']}\n")
     f.write(f"  TTA: {CONFIG['use_tta']} ({CONFIG['tta_transforms']} transforms)\n\n")
     f.write("Classification Report:\n")
     f.write(report)
@@ -1756,18 +1756,18 @@ def export_for_production(model, model_name, save_dir, example_input):
         logging.warning(f"ONNX export failed: {e}")
 
 example_input = torch.randn(1, 3, CONFIG['img_size'], CONFIG['img_size']).to(DEVICE)
-export_for_production(model, "Enhanced_MobileNetV3_Small", OUTPUT_DIRS["exports"], example_input)
+export_for_production(model, f"Optimized_{CONFIG['backbone']}", OUTPUT_DIRS["exports"], example_input)
 
 # %% [markdown]
 # ## PHASE 12: Inference Class
 
 # %%
-class EnhancedRiceFieldAnalyzer:
+class OptimizedRiceFieldAnalyzer:
     def __init__(self, yolo_model_path, classification_model_path, device=DEVICE):
         self.device = device
         self.yolo_model = YOLO(yolo_model_path)
         
-        self.classifier = build_enhanced_mobilenetv3(len(LABELS))
+        self.classifier = build_enhanced_classifier(len(LABELS))
         self.classifier.load_state_dict(torch.load(classification_model_path, map_location=device))
         self.classifier.to(device)
         self.classifier.eval()
@@ -1799,7 +1799,6 @@ class EnhancedRiceFieldAnalyzer:
             crop_pil = Image.fromarray(crop)
             
             if use_tta and CONFIG['use_tta']:
-                # TTA inference
                 tta_transforms = [
                     self.transform,
                     transforms.Compose([
@@ -1875,13 +1874,13 @@ class EnhancedRiceFieldAnalyzer:
             print(f"  {disease:15s}: {count:3d} ({pct:5.1f}%)")
         print("="*60)
 
-analyzer = EnhancedRiceFieldAnalyzer(
+analyzer = OptimizedRiceFieldAnalyzer(
     yolo_model_path=best_yolo_model,
     classification_model_path=best_checkpoint,
     device=DEVICE
 )
 
-logging.info("\n✓ Enhanced Analyzer ready for inference")
+logging.info("\n✓ Optimized Analyzer ready for inference")
 
 # %% [markdown]
 # ## PHASE 13: Demo
@@ -1907,25 +1906,21 @@ for i, sample in enumerate(samples):
 
 # %%
 logging.info("\n" + "="*80)
-logging.info("COMPLETE ENHANCED PIPELINE FINISHED")
+logging.info("OPTIMIZED PIPELINE COMPLETE")
 logging.info("="*80)
 logging.info(f"Output: {PATH_OUTPUT}")
-logging.info(f"\nModel: Enhanced MobileNetV3-Small")
-logging.info(f"\nEnhancements Applied:")
+logging.info(f"\nModel: {CONFIG['backbone']}")
+logging.info(f"\nKey Optimizations:")
+logging.info("  ✓ YOLO 1-class (leaf detection only)")
+logging.info(f"  ✓ Lesion-aware filtering (top-{CONFIG['crops_per_image']} crops)")
+logging.info(f"  ✓ Symmetric Cross-Entropy (alpha={CONFIG['sce_alpha']}, beta={CONFIG['sce_beta']})")
+logging.info(f"  ✓ EMA (decay={CONFIG['ema_decay']})")
+logging.info("  ✓ Weighted Random Sampler")
+logging.info(f"  ✓ Logit Adjustment (tau={CONFIG['logit_adjustment_tau']})")
 if CONFIG['use_cbam']:
-    logging.info("  ✓ CBAM Attention Module")
+    logging.info("  ✓ CBAM Attention")
 if CONFIG['use_better_head']:
-    logging.info("  ✓ Enhanced Classification Head (Dual Pooling)")
-if CONFIG['use_cutmix']:
-    logging.info("  ✓ CutMix Augmentation")
-if CONFIG['use_mixup']:
-    logging.info("  ✓ MixUp Augmentation")
-if CONFIG['use_progressive_resize']:
-    logging.info("  ✓ Progressive Resizing")
-if CONFIG['use_label_smoothing']:
-    logging.info("  ✓ Label Smoothing")
-if CONFIG['use_tta']:
-    logging.info(f"  ✓ Test-Time Augmentation ({CONFIG['tta_transforms']} transforms)")
+    logging.info("  ✓ Enhanced Head (Dual Pooling)")
 
 logging.info(f"\nFinal Test Results:")
 logging.info(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
@@ -1934,7 +1929,7 @@ logging.info(f"  Recall:    {test_metrics['recall']:.4f}")
 logging.info(f"  F1 Score:  {test_metrics['f1']:.4f}")
 
 logging.info(f"\nAll Visualizations:")
-logging.info("  ✓ Crop extraction samples (6 samples)")
+logging.info("  ✓ Crop extraction samples (with lesion scores)")
 logging.info("  ✓ Data analysis report (9 charts)")
 logging.info("  ✓ Training report (9 charts)")
 logging.info("  ✓ Test results report (6 visualizations)")
