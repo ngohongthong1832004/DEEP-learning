@@ -25,6 +25,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms, models
+import cv2
 
 try:
     from torch.amp import GradScaler, autocast
@@ -44,8 +45,8 @@ def seed_everything(seed=42):
     os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 seed_everything(42)
 
@@ -65,7 +66,7 @@ CONFIG = {
     # Training
     'img_size': 224,
     'batch_size': 128,
-    'epochs': 50,
+    'epochs': 5,
     'lr': 2e-4,
     'num_workers': 8,
     'pin_memory': True,
@@ -83,6 +84,11 @@ CONFIG = {
     'ema_decay': 0.999,
     'use_mixup': True,
     'mixup_alpha': 0.1,
+    
+    # CLAHE preprocessing
+    'use_clahe': True,
+    'clahe_clip_limit': 2.0,
+    'clahe_tile_size': (8, 8),
     
     # Early stopping
     'patience': 12,
@@ -139,25 +145,25 @@ logger = setup_logging(PATH_OUTPUT)
 LABELS = {
     0: {"name": "brown_spot", "match_substrings": [
         "../data_total/brown_spot",
-        "../data/yolo_detected_epoch_40/paddy_disease_train/brown_spot/crops",
-        "../data/yolo_detected_epoch_40/sikhaok_train/BrownSpot/crops",
+        # "../data/yolo_detected_epoch_40/paddy_disease_train/brown_spot/crops",
+        # "../data/yolo_detected_epoch_40/sikhaok_train/BrownSpot/crops",
     ]},
     1: {"name": "leaf_blast", "match_substrings": [
         "../data_total/blast",
-        "../data/yolo_detected_epoch_40/paddy_disease_train/blast/crops",
-        "../data/yolo_detected_epoch_40/sikhaok_train/LeafBlast/crops",
+        # "../data/yolo_detected_epoch_40/paddy_disease_train/blast/crops",
+        # "../data/yolo_detected_epoch_40/sikhaok_train/LeafBlast/crops",
     ]},
     2: {"name": "leaf_blight", "match_substrings": [
         "../data_total/bacterial_leaf_blight",
-        "../data/yolo_detected_epoch_40/paddy_disease_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_40/sikhaok_train/Bacterialblight1/crops",
-        "../data/yolo_detected_epoch_40/trumanrase_train/bacterial_leaf_blight/crops",
+        # "../data/yolo_detected_epoch_40/paddy_disease_train/bacterial_leaf_blight/crops",
+        # "../data/yolo_detected_epoch_40/sikhaok_train/Bacterialblight1/crops",
+        # "../data/yolo_detected_epoch_40/trumanrase_train/bacterial_leaf_blight/crops",
     ]},
     3: {"name": "healthy", "match_substrings": [
         "../data_total/normal",
-        "../data/yolo_detected_epoch_40/paddy_disease_train/normal/crops",
-        "../data/yolo_detected_epoch_40/sikhaok_train/Healthy/crops",
-        "../data/raw/paddy_disease_classification/train_images/normal",
+        # "../data/yolo_detected_epoch_40/paddy_disease_train/normal/crops",
+        # "../data/yolo_detected_epoch_40/sikhaok_train/Healthy/crops",
+        # "../data/raw/paddy_disease_classification/train_images/normal",
     ]},
 }
 
@@ -914,6 +920,48 @@ class ModelEMA:
             else:
                 v.copy_(msd[k])
 
+# ===== CLAHE TRANSFORM =====
+class CLAHETransform:
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to PIL Images"""
+    
+    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
+        """
+        Args:
+            clip_limit: Threshold for contrast limiting (higher = more contrast)
+            tile_grid_size: Size of grid for histogram equalization (e.g., (8,8))
+        """
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    
+    def __call__(self, pil_image):
+        """
+        Apply CLAHE to PIL Image
+        
+        Args:
+            pil_image: PIL Image in RGB format
+            
+        Returns:
+            PIL Image with CLAHE applied
+        """
+        # Convert PIL to numpy array
+        img_array = np.array(pil_image)
+        
+        # Convert RGB to LAB color space (better for CLAHE)
+        lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+        
+        # Apply CLAHE to L channel (luminance)
+        lab[:, :, 0] = self.clahe.apply(lab[:, :, 0])
+        
+        # Convert back to RGB
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        
+        # Convert back to PIL Image
+        return Image.fromarray(enhanced.astype(np.uint8))
+    
+    def __repr__(self):
+        return f"CLAHETransform(clip_limit={self.clip_limit}, tile_grid_size={self.tile_grid_size})"
+
 # ===== DATASET =====
 class ImageDataset(Dataset):
     def __init__(self, df, transform=None):
@@ -933,7 +981,24 @@ class ImageDataset(Dataset):
 
 # ===== TRANSFORMS =====
 def get_transforms(size):
-    train_transform = transforms.Compose([
+    """Get training and validation transforms with optional CLAHE preprocessing"""
+    
+    # Base transform components
+    base_train_transforms = []
+    base_val_transforms = []
+    
+    # Add CLAHE if enabled
+    if CONFIG['use_clahe']:
+        clahe_transform = CLAHETransform(
+            clip_limit=CONFIG['clahe_clip_limit'],
+            tile_grid_size=CONFIG['clahe_tile_size']
+        )
+        base_train_transforms.append(clahe_transform)
+        base_val_transforms.append(clahe_transform)
+        logging.info(f"CLAHE enabled: clip_limit={CONFIG['clahe_clip_limit']}, tile_size={CONFIG['clahe_tile_size']}")
+    
+    # Training transforms
+    train_transforms = base_train_transforms + [
         transforms.RandomResizedCrop(size, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
@@ -941,13 +1006,17 @@ def get_transforms(size):
         transforms.TrivialAugmentWide(num_magnitude_bins=31),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    ]
     
-    val_transform = transforms.Compose([
+    # Validation transforms
+    val_transforms = base_val_transforms + [
         transforms.Resize((size, size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    ]
+    
+    train_transform = transforms.Compose(train_transforms)
+    val_transform = transforms.Compose(val_transforms)
     
     return train_transform, val_transform
 
@@ -1011,6 +1080,11 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
     else:
         criterion = nn.CrossEntropyLoss()
     
+    # Prepare loaders first (needed for steps_per_epoch)
+    train_transform, val_transform = get_transforms(CONFIG['img_size'])
+    train_loader = make_loader(train_df, train_transform, CONFIG['batch_size'], train=True)
+    val_loader = make_loader(val_df, val_transform, CONFIG['batch_size'], train=False)
+    
     # Optimizer & Scheduler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-4)
     steps_per_epoch = len(train_loader)
@@ -1026,11 +1100,6 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
     
     # EMA
     ema = ModelEMA(model, decay=CONFIG['ema_decay']) if CONFIG['use_ema'] else None
-    
-    # Prepare loaders
-    train_transform, val_transform = get_transforms(CONFIG['img_size'])
-    train_loader = make_loader(train_df, train_transform, CONFIG['batch_size'], train=True)
-    val_loader = make_loader(val_df, val_transform, CONFIG['batch_size'], train=False)
     
     best_val_acc = 0.0
     bad_epochs = 0
@@ -1800,6 +1869,72 @@ def plot_advanced_metrics_visualization(all_test_metrics, all_histories, all_ben
     return advanced_viz_path
 
 # %%
+def create_clahe_demo(test_df, num_samples=8):
+    """Create CLAHE comparison demo"""
+    
+    logging.info("\n" + "="*60)
+    logging.info("CREATING CLAHE DEMONSTRATION")
+    logging.info("="*60)
+    
+    # Sample images from each class
+    class_names = [LABELS[i]['name'] for i in sorted(LABELS.keys())]
+    demo_samples = []
+    
+    for class_id in range(len(class_names)):
+        class_data = test_df[test_df['label_id'] == class_id]
+        if len(class_data) > 0:
+            samples = class_data.sample(min(2, len(class_data)), random_state=42)
+            demo_samples.extend(samples.to_dict('records'))
+    
+    # Limit total samples
+    if len(demo_samples) > num_samples:
+        demo_samples = demo_samples[:num_samples]
+    
+    # Create CLAHE transform
+    clahe_transform = CLAHETransform(
+        clip_limit=CONFIG['clahe_clip_limit'],
+        tile_grid_size=CONFIG['clahe_tile_size']
+    )
+    
+    # Create comparison figure
+    cols = 2  # Original, CLAHE
+    rows = len(demo_samples)
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows))
+    
+    if rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    for idx, sample in enumerate(demo_samples):
+        # Load image
+        img_path = sample['image_path']
+        original_img = Image.open(img_path).convert('RGB')
+        
+        # Apply CLAHE
+        clahe_img = clahe_transform(original_img)
+        
+        # Display original
+        axes[idx, 0].imshow(original_img)
+        axes[idx, 0].set_title(f'Original - {sample["label_name"]}', fontweight='bold')
+        axes[idx, 0].axis('off')
+        
+        # Display CLAHE enhanced
+        axes[idx, 1].imshow(clahe_img)
+        axes[idx, 1].set_title(f'CLAHE Enhanced - {sample["label_name"]}', fontweight='bold')
+        axes[idx, 1].axis('off')
+    
+    plt.suptitle(f'CLAHE Comparison (clip_limit={CONFIG["clahe_clip_limit"]}, tile_size={CONFIG["clahe_tile_size"]})', 
+                 fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
+    # Save demo
+    demo_path = os.path.join(OUTPUT_DIRS["demo"], "clahe_comparison.png")
+    plt.savefig(demo_path, dpi=200, bbox_inches='tight')
+    plt.show()
+    
+    logging.info(f"✓ CLAHE demo saved: {demo_path}")
+    
+    return demo_path
+
 def create_demo_predictions(all_checkpoints, test_df, num_samples=16):
     """Create demo predictions with sample images"""
     
@@ -1914,6 +2049,10 @@ def create_demo_predictions(all_checkpoints, test_df, num_samples=16):
     gc.collect()
     
     return demo_results
+
+# Create CLAHE demonstration
+if CONFIG['use_clahe']:
+    clahe_demo_path = create_clahe_demo(test_df)
 
 # Create demo predictions
 demo_results = create_demo_predictions(all_checkpoints, test_df)
@@ -2115,5 +2254,4 @@ logging.info(f"Simple summary: {simple_path}")
 logging.info(f"Comprehensive results: {summary_path}")
 logging.info(f"Training curves: {os.path.join(OUTPUT_DIRS['plots'], 'training_curves.png')}")
 logging.info(f"Demo predictions: {os.path.join(OUTPUT_DIRS['demo'], 'predictions_demo.png')}")
-logging.info(f"Performance chart: {perf_chart_path}")
 logging.info("="*80)

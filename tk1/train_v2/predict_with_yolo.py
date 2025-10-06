@@ -7,6 +7,7 @@ from tqdm import tqdm
 from pathlib import Path
 import gc
 from datetime import datetime
+import time
 
 import torch
 import torch.nn as nn
@@ -317,6 +318,105 @@ def collect_images(input_dir: str) -> List[str]:
     return paths
 
 
+def extract_true_label_from_path(image_path: str, label_mapping: Dict[str, str] = None) -> Tuple[str, int]:
+    """
+    Trích xuất true label từ đường dẫn ảnh hoặc tên folder.
+    
+    Args:
+        image_path: Đường dẫn đến ảnh
+        label_mapping: Mapping từ folder name/file prefix sang label name
+    
+    Returns:
+        (true_label, true_label_idx)
+    """
+    # Reverse mapping từ LABELS
+    name_to_idx = {v['name']: k for k, v in LABELS.items()}
+    
+    # Thử extract từ parent folder name
+    parent_folder = os.path.basename(os.path.dirname(image_path)).lower()
+    filename = os.path.basename(image_path).lower()
+    
+    # Nếu có custom mapping
+    if label_mapping:
+        for key, label_name in label_mapping.items():
+            if key.lower() in parent_folder or key.lower() in filename:
+                return label_name, name_to_idx.get(label_name, -1)
+    
+    # Thử match với các label có sẵn
+    for label_name in name_to_idx.keys():
+        if label_name.lower() in parent_folder or label_name.lower() in filename:
+            return label_name, name_to_idx[label_name]
+    
+    # Một số pattern phổ biến
+    common_patterns = {
+        'bacterial_leaf_blight': ['bacterial', 'blight', 'blb'],
+        'blast': ['blast', 'leaf_blast'],
+        'brown_spot': ['brown', 'spot', 'brown_spot'],
+        'normal': ['normal', 'healthy', 'good']
+    }
+    
+    for label_name, patterns in common_patterns.items():
+        for pattern in patterns:
+            if pattern in parent_folder or pattern in filename:
+                return label_name, name_to_idx.get(label_name, -1)
+    
+    # Mặc định: không xác định được
+    return "unknown", -1
+
+
+def calculate_summary_metrics(detailed_results: List[Dict]) -> Dict:
+    """
+    Tính toán các metrics tổng hợp từ kết quả chi tiết.
+    
+    Returns:
+        Dict với các metrics như accuracy, avg_confidence, avg_fps, etc.
+    """
+    if not detailed_results:
+        return {}
+    
+    # Filter out unknown labels khi tính accuracy
+    valid_results = [r for r in detailed_results if r['is_correct'] is not None]
+    
+    metrics = {}
+    
+    # Basic metrics
+    metrics['total_images'] = len(detailed_results)
+    metrics['valid_labels'] = len(valid_results)
+    
+    if valid_results:
+        # Accuracy
+        correct_predictions = sum(1 for r in valid_results if r['is_correct'])
+        metrics['accuracy'] = correct_predictions / len(valid_results)
+        
+        # Confidence stats
+        confidences = [r['confidence'] for r in detailed_results]
+        metrics['avg_confidence'] = np.mean(confidences)
+        metrics['min_confidence'] = np.min(confidences)
+        metrics['max_confidence'] = np.max(confidences)
+        
+        # Timing stats
+        inference_times = [r['inference_time_ms'] for r in detailed_results]
+        metrics['avg_inference_time_ms'] = np.mean(inference_times)
+        metrics['total_inference_time_ms'] = np.sum(inference_times)
+        metrics['fps'] = 1000.0 / np.mean(inference_times)  # FPS = 1000ms / avg_time_ms
+        
+        # Per-class accuracy
+        class_stats = {}
+        for result in valid_results:
+            true_label = result['true_label']
+            if true_label not in class_stats:
+                class_stats[true_label] = {'correct': 0, 'total': 0}
+            class_stats[true_label]['total'] += 1
+            if result['is_correct']:
+                class_stats[true_label]['correct'] += 1
+        
+        for class_name, stats in class_stats.items():
+            metrics[f'{class_name}_accuracy'] = stats['correct'] / stats['total']
+            metrics[f'{class_name}_count'] = stats['total']
+    
+    return metrics
+
+
 def make_label_mapper(mode: str = "binary_blast", custom_map: Dict[str, str] = None):
     """Tạo hàm mapping label."""
     id2name = {i: LABELS[i]['name'] for i in sorted(LABELS.keys())}
@@ -374,7 +474,200 @@ def aggregate_predictions(pred_indices: List[int], pred_probs: np.ndarray,
         raise ValueError(f"Unknown method: {method}")
 
 
-# ===== PREDICTION WITH YOLO =====
+# ===== COMPREHENSIVE PREDICTION WITH YOLO =====
+@torch.no_grad()
+def predict_single_model_comprehensive(
+    input_dir: str,
+    output_csv: str,
+    model_name: str,
+    checkpoint_path: str,
+    yolo_detector: YOLODetector,
+    img_size: int = 224,
+    batch_size: int = 32,
+    label_mode: str = "multiclass",
+    custom_label_map: Dict[str, str] = None,
+    aggregation_method: str = "max_confidence",
+    save_crops: bool = False,
+    timestamp: str = None,
+    true_label_mapping: Dict[str, str] = None,
+) -> Tuple[str, List[Dict]]:
+    """
+    Dự đoán với YOLO preprocessing và thu thập đầy đủ metrics.
+    
+    Returns comprehensive metrics including:
+    - image_path, true_label, true_label_idx
+    - predicted_label, predicted_label_idx, confidence
+    - is_correct, inference_time_ms, model_name
+    """
+    device = DEVICE
+    
+    # Thu thập ảnh
+    image_paths = collect_images(input_dir)
+    if len(image_paths) == 0:
+        raise ValueError(f"Không tìm thấy ảnh trong: {input_dir}")
+    
+    logging.info(f"📸 Tìm thấy {len(image_paths)} ảnh trong {input_dir}")
+
+    # Load classifier
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"❌ Checkpoint không tồn tại: {checkpoint_path}")
+    
+    num_classes = len(LABELS)
+    model = build_classifier(model_name, num_classes, use_cbam=True, use_better_head=True)
+    
+    state = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(state['model_state_dict'])
+    model.to(device).eval()
+    
+    logging.info(f"✅ Đã load classifier: {model_name}")
+
+    # Transform và label mapper
+    transform = get_val_transform(img_size)
+    mapper = make_label_mapper(mode=label_mode, custom_map=custom_label_map)
+
+    # Predict từng ảnh và thu thập metrics
+    detailed_results = []
+    crops_dir = Path(OUTPUT_DIRS["crops"]) / model_name if save_crops else None
+    if crops_dir:
+        crops_dir.mkdir(parents=True, exist_ok=True)
+    
+    for img_path in tqdm(image_paths, desc=f"🔮 Predicting - {model_name}"):
+        # Bắt đầu đo thời gian
+        start_time = time.perf_counter()
+        
+        fname = os.path.basename(img_path)
+        
+        # Extract true label
+        true_label, true_label_idx = extract_true_label_from_path(img_path, true_label_mapping)
+        
+        # 1. YOLO detection & crop
+        crops = yolo_detector.detect_and_crop(img_path)
+        
+        if len(crops) == 0:
+            # Không detect được -> healthy/normal
+            predicted_label_idx = 3  # normal
+            confidence = 0.0
+        else:
+            # 2. Classify từng crop
+            dataset = CropDataset(crops, transform)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            
+            all_preds = []
+            all_probs = []
+            
+            for batch in loader:
+                batch = batch.to(device)
+                logits = model(batch)
+                probs = torch.softmax(logits, dim=1)
+                preds = logits.argmax(dim=1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_probs.append(probs.cpu().numpy())
+            
+            all_probs = np.vstack(all_probs)
+            
+            # 3. Aggregate predictions
+            predicted_label_idx, confidence = aggregate_predictions(
+                all_preds, all_probs, method=aggregation_method
+            )
+        
+        # Kết thúc đo thời gian
+        end_time = time.perf_counter()
+        inference_time_ms = (end_time - start_time) * 1000
+        
+        # Map predicted label
+        predicted_label = mapper(int(predicted_label_idx))
+        
+        # Tính is_correct
+        is_correct = (true_label_idx == predicted_label_idx) if true_label_idx != -1 else None
+        
+        # Lưu kết quả chi tiết
+        result = {
+            'image_path': img_path,
+            'true_label': true_label,
+            'true_label_idx': true_label_idx,
+            'predicted_label': predicted_label,
+            'predicted_label_idx': int(predicted_label_idx),
+            'confidence': float(confidence),
+            'is_correct': is_correct,
+            'inference_time_ms': inference_time_ms,
+            'model_name': model_name
+        }
+        detailed_results.append(result)
+        
+        # 4. Save crops (optional, for debugging)
+        if save_crops and crops_dir and len(crops) > 0:
+            img_crop_dir = crops_dir / Path(fname).stem
+            img_crop_dir.mkdir(exist_ok=True)
+            for i, crop in enumerate(crops):
+                crop_path = img_crop_dir / f"crop_{i:03d}.jpg"
+                Image.fromarray(crop).save(crop_path)
+
+    # Thêm timestamp vào tên file nếu có
+    if timestamp:
+        base_path, ext = os.path.splitext(output_csv)
+        output_csv = f"{base_path}_{timestamp}{ext}"
+    
+    # Ghi CSV comprehensive
+    os.makedirs(os.path.dirname(output_csv) or '.', exist_ok=True)
+    with open(output_csv, "w", newline="", encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # Header với tất cả metrics
+        writer.writerow([
+            "image_path", "true_label", "true_label_idx",
+            "predicted_label", "predicted_label_idx", "confidence",
+            "is_correct", "inference_time_ms", "model_name"
+        ])
+        
+        # Ghi từng row
+        for result in detailed_results:
+            writer.writerow([
+                result['image_path'],
+                result['true_label'],
+                result['true_label_idx'],
+                result['predicted_label'],
+                result['predicted_label_idx'],
+                f"{result['confidence']:.4f}",
+                result['is_correct'],
+                f"{result['inference_time_ms']:.2f}",
+                result['model_name']
+            ])
+
+    logging.info(f"💾 Đã lưu comprehensive predictions: {output_csv}")
+    
+    # Tính và lưu summary metrics
+    summary_metrics = calculate_summary_metrics(detailed_results)
+    summary_csv = output_csv.replace('.csv', '_summary.csv')
+    
+    with open(summary_csv, "w", newline="", encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        writer.writerow(["model_name", model_name])
+        
+        for metric_name, value in summary_metrics.items():
+            if isinstance(value, float):
+                writer.writerow([metric_name, f"{value:.4f}"])
+            else:
+                writer.writerow([metric_name, value])
+    
+    logging.info(f"📊 Đã lưu summary metrics: {summary_csv}")
+    
+    # In một số metrics quan trọng
+    if summary_metrics:
+        print(f"    📊 Accuracy: {summary_metrics.get('accuracy', 'N/A'):.3f}")
+        print(f"    🎯 Avg Confidence: {summary_metrics.get('avg_confidence', 'N/A'):.3f}")
+        print(f"    ⚡ FPS: {summary_metrics.get('fps', 'N/A'):.1f}")
+        print(f"    ⏱️  Avg Time: {summary_metrics.get('avg_inference_time_ms', 'N/A'):.1f}ms")
+    
+    # Clean up
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return output_csv, detailed_results
+
+
+# ===== ORIGINAL PREDICTION WITH YOLO =====
 @torch.no_grad()
 def predict_single_model_with_yolo(
     input_dir: str,
@@ -494,6 +787,119 @@ def predict_single_model_with_yolo(
 
 
 @torch.no_grad()
+def predict_multi_models_comprehensive(
+    input_dir: str,
+    output_dir: str,
+    model_configs: List[Tuple[str, str]],
+    yolo_checkpoint: str,
+    img_size: int = 224,
+    batch_size: int = 32,
+    label_mode: str = "multiclass",
+    custom_label_map: Dict[str, str] = None,
+    aggregation_method: str = "max_confidence",
+    save_crops: bool = False,
+    add_timestamp: bool = True,
+    true_label_mapping: Dict[str, str] = None,
+    output_format: str = "comprehensive",  # "simple" or "comprehensive"
+) -> List[Tuple[str, str]]:
+    """
+    Chạy prediction cho nhiều models với YOLO preprocessing.
+    
+    Args:
+        output_format: "simple" cho format cũ (image_id, label) 
+                      "comprehensive" cho format mới với đầy đủ metrics
+    """
+    # Tạo timestamp cho session này
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if add_timestamp else None
+    
+    # Tạo output directory với timestamp nếu được bật
+    if timestamp:
+        timestamped_output_dir = os.path.join(output_dir, f"predictions_{timestamp}")
+        os.makedirs(timestamped_output_dir, exist_ok=True)
+        final_output_dir = timestamped_output_dir
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+        final_output_dir = output_dir
+    
+    # Initialize YOLO detector (dùng chung cho tất cả models)
+    yolo_detector = YOLODetector(
+        yolo_checkpoint,
+        conf_thresh=YOLO_CONFIG['conf_thresh'],
+        iou_thresh=YOLO_CONFIG['iou_thresh'],
+        img_size=YOLO_CONFIG['img_size'],
+        max_det=YOLO_CONFIG['max_det']
+    )
+    
+    results = []
+    total = len(model_configs)
+    
+    print("\n" + "="*70)
+    print(f"🚀 BẮT ĐẦU PREDICTION VỚI {total} MODELS + YOLO PREPROCESSING")
+    print(f"📊 Format: {output_format.upper()}")
+    print("="*70)
+    
+    for idx, (model_name, checkpoint_path) in enumerate(model_configs, 1):
+        print(f"\n[{idx}/{total}] Model: {model_name}")
+        print("-"*70)
+        
+        try:
+            safe_name = model_name.replace('/', '_').replace('\\', '_')
+            
+            if output_format == "comprehensive":
+                csv_path = os.path.join(final_output_dir, f"comprehensive_{safe_name}.csv")
+                
+                csv_path, _ = predict_single_model_comprehensive(
+                    input_dir=input_dir,
+                    output_csv=csv_path,
+                    model_name=model_name,
+                    checkpoint_path=checkpoint_path,
+                    yolo_detector=yolo_detector,
+                    img_size=img_size,
+                    batch_size=batch_size,
+                    label_mode=label_mode,
+                    custom_label_map=custom_label_map,
+                    aggregation_method=aggregation_method,
+                    save_crops=save_crops,
+                    timestamp=None,  # Timestamp đã được thêm vào folder
+                    true_label_mapping=true_label_mapping,
+                )
+            else:  # simple format
+                csv_path = os.path.join(final_output_dir, f"predictions_{safe_name}.csv")
+                
+                csv_path, _ = predict_single_model_with_yolo(
+                    input_dir=input_dir,
+                    output_csv=csv_path,
+                    model_name=model_name,
+                    checkpoint_path=checkpoint_path,
+                    yolo_detector=yolo_detector,
+                    img_size=img_size,
+                    batch_size=batch_size,
+                    label_mode=label_mode,
+                    custom_label_map=custom_label_map,
+                    aggregation_method=aggregation_method,
+                    save_crops=save_crops,
+                    timestamp=None,
+                )
+            
+            results.append((model_name, csv_path))
+            print(f"✅ Hoàn thành: {model_name}")
+            
+        except Exception as e:
+            logging.error(f"❌ Lỗi với {model_name}: {e}")
+            print(f"❌ Lỗi: {e}")
+            continue
+    
+    print("\n" + "="*70)
+    print(f"🎉 HOÀN THÀNH! Đã tạo {len(results)}/{total} file CSV")
+    if timestamp:
+        print(f"📁 Thư mục kết quả: {final_output_dir}")
+        print(f"⏰ Timestamp: {timestamp}")
+    print("="*70)
+    
+    return results
+
+
+@torch.no_grad()
 def predict_multi_models_with_yolo(
     input_dir: str,
     output_dir: str,
@@ -595,7 +1001,7 @@ if __name__ == "__main__":
     print("="*70)
     
     # ===== CẤU HÌNH =====
-    INPUT_DIR = "../data/raw/paddy_disease_classification/test_images"
+    INPUT_DIR = "../data/raw/Original Images"
     OUTPUT_CSV_DIR = OUTPUT_DIRS["results"]
     
     MODEL_CONFIGS = [
@@ -610,19 +1016,49 @@ if __name__ == "__main__":
     LABEL_MODE = "multiclass"  # Thay đổi từ "binary_blast" để hiển thị đầy đủ 4 class
     AGGREGATION_METHOD = "max_confidence"  # hoặc "majority_vote"
     
+    # ===== TÙY CHỌN FORMAT OUTPUT =====
+    # Có thể chọn "simple" (format cũ) hoặc "comprehensive" (format mới với đầy đủ metrics)
+    OUTPUT_FORMAT = "comprehensive"  # Thay đổi thành "simple" nếu muốn format cũ
+    
+    # Label mapping cho true labels (nếu cần tùy chỉnh)
+    TRUE_LABEL_MAPPING = {
+        # Ví dụ: nếu folder/filename chứa pattern này thì map sang label tương ứng
+        # "bacterial": "bacterial_leaf_blight",
+        # "blast": "blast", 
+        # "brown": "brown_spot",
+        # "normal": "normal"
+    }
+    
     # ===== CHẠY PREDICTION =====
     try:
-        outputs = predict_multi_models_with_yolo(
-            input_dir=INPUT_DIR,
-            output_dir=OUTPUT_CSV_DIR,
-            model_configs=MODEL_CONFIGS,
-            yolo_checkpoint=YOLO_CONFIG['checkpoint'],
-            img_size=CONFIG['img_size'],
-            batch_size=CONFIG['batch_size'],
-            label_mode=LABEL_MODE,
-            aggregation_method=AGGREGATION_METHOD,
-            save_crops=CONFIG['save_crops'],
-        )
+        if OUTPUT_FORMAT == "comprehensive":
+            print("📊 Sử dụng COMPREHENSIVE format với đầy đủ metrics!")
+            outputs = predict_multi_models_comprehensive(
+                input_dir=INPUT_DIR,
+                output_dir=OUTPUT_CSV_DIR,
+                model_configs=MODEL_CONFIGS,
+                yolo_checkpoint=YOLO_CONFIG['checkpoint'],
+                img_size=CONFIG['img_size'],
+                batch_size=CONFIG['batch_size'],
+                label_mode=LABEL_MODE,
+                aggregation_method=AGGREGATION_METHOD,
+                save_crops=CONFIG['save_crops'],
+                output_format="comprehensive",
+                true_label_mapping=TRUE_LABEL_MAPPING,
+            )
+        else:
+            print("📊 Sử dụng SIMPLE format (tương thích cũ)")
+            outputs = predict_multi_models_with_yolo(
+                input_dir=INPUT_DIR,
+                output_dir=OUTPUT_CSV_DIR,
+                model_configs=MODEL_CONFIGS,
+                yolo_checkpoint=YOLO_CONFIG['checkpoint'],
+                img_size=CONFIG['img_size'],
+                batch_size=CONFIG['batch_size'],
+                label_mode=LABEL_MODE,
+                aggregation_method=AGGREGATION_METHOD,
+                save_crops=CONFIG['save_crops'],
+            )
         
         print("\n" + "="*70)
         print("📊 DANH SÁCH FILE CSV ĐÃ TẠO:")
@@ -633,6 +1069,65 @@ if __name__ == "__main__":
         print(f"\n✨ Hoàn tất! Kiểm tra thư mục: {OUTPUT_CSV_DIR}")
         print("="*70 + "\n")
         
+        # Hiển thị format CSV được tạo
+        if OUTPUT_FORMAT == "comprehensive":
+            print("📊 COMPREHENSIVE CSV FORMAT bao gồm:")
+            print("   • image_path: Đường dẫn đầy đủ đến ảnh")
+            print("   • true_label: Label thật (từ folder/filename)")
+            print("   • true_label_idx: Index của true label")  
+            print("   • predicted_label: Label dự đoán")
+            print("   • predicted_label_idx: Index của predicted label")
+            print("   • confidence: Độ tin cậy dự đoán (0-1)")
+            print("   • is_correct: True/False/None nếu dự đoán đúng")
+            print("   • inference_time_ms: Thời gian inference (ms)")
+            print("   • model_name: Tên model")
+            print("\n📈 SUMMARY CSV (_summary.csv) bao gồm:")
+            print("   • accuracy, avg_confidence, fps")
+            print("   • avg_inference_time_ms, per-class accuracy")
+            print("   • total_images, valid_labels")
+        
     except Exception as e:
         print(f"\n❌ LỖI: {e}")
         logging.error(f"Lỗi chính: {e}", exc_info=True)
+
+
+# ===== USAGE EXAMPLES =====
+"""
+CÁCH SỬ DỤNG:
+
+1. COMPREHENSIVE FORMAT (Mới - đầy đủ metrics):
+   - Thay đổi OUTPUT_FORMAT = "comprehensive"
+   - Sẽ tạo 2 files cho mỗi model:
+     * comprehensive_[model].csv: Chi tiết từng ảnh
+     * comprehensive_[model]_summary.csv: Metrics tổng hợp
+
+2. SIMPLE FORMAT (Cũ - tương thích):
+   - Thay đổi OUTPUT_FORMAT = "simple" 
+   - Chỉ tạo predictions_[model].csv với format (image_id, label)
+
+3. CẤU HÌNH TRUE LABELS:
+   - Chỉnh sửa TRUE_LABEL_MAPPING nếu cần mapping đặc biệt
+   - Hệ thống tự động detect từ folder/filename pattern:
+     * bacterial_leaf_blight, blast, brown_spot, normal
+
+4. CẤU HÌNH YOLO:
+   - YOLO_CONFIG: threshold, checkpoint path
+   - AGGREGATION_METHOD: "max_confidence" hoặc "majority_vote"
+
+COMPREHENSIVE CSV COLUMNS:
+- image_path: /path/to/image.jpg
+- true_label: bacterial_leaf_blight  
+- true_label_idx: 2
+- predicted_label: blast
+- predicted_label_idx: 1
+- confidence: 0.8542
+- is_correct: False
+- inference_time_ms: 45.23
+- model_name: efficientnet_b0
+
+SUMMARY METRICS:
+- accuracy: Độ chính xác tổng thể
+- fps: Frames per second (1000/avg_inference_time_ms)
+- avg_confidence: Confidence trung bình
+- [class]_accuracy: Accuracy per class
+"""
