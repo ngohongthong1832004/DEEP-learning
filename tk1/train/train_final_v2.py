@@ -173,10 +173,26 @@ logger = setup_logging(PATH_OUTPUT)
 # %%
 # ===== LABELS =====
 LABELS = {
-    0: {"name": "brown_spot", "match_substrings": ["../data/new_data_field_rice/brown_spot"]},
-    1: {"name": "leaf_blast", "match_substrings": ["../data/new_data_field_rice/leaf_blast"]},
-    2: {"name": "leaf_blight", "match_substrings": ["../data/new_data_field_rice/leaf_blight"]},
-    3: {"name": "healthy", "match_substrings": ["../data/new_data_field_rice/healthy"]}
+    0: {"name": "brown_spot", "match_substrings": [
+        "./data/brown_spot",
+        "../data/yolo_detected/paddy_disease_train/brown_spot/crops",
+        "../data/yolo_detected/sikhaok_train/BrownSpot/crops",
+        ]},
+    1: {"name": "leaf_blast", "match_substrings": [
+        "./data/blast",
+        "../data/yolo_detected/paddy_disease_train/leaf_blast/crops",
+        "../data/yolo_detected/sikhaok_train/LeafBlast/crops",
+        ]},
+    2: {"name": "leaf_blight", "match_substrings": [
+        "./data/bacterial_leaf_blight",
+        "../data/yolo_detected/paddy_disease_train/bacterial_leaf_blight/crops",
+        "../data/yolo_detected/sikhaok_train/Bacterialblight1/crops",
+        ]},
+    3: {"name": "healthy", "match_substrings": [
+        "./data/normal",
+        "../data/yolo_detected/paddy_disease_train/healthy/crops",
+        "../data/yolo_detected/sikhaok_train/Healthy/crops",
+        ]}
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -261,7 +277,19 @@ def auto_collect_dataset():
     
     df = pd.DataFrame(all_data)
     logging.info(f"\nTotal: {len(df)} images")
-    logging.info(f"\nBy label:\n{df.groupby('label_name').size()}")
+    
+    # Debug: Check DataFrame structure
+    if len(df) > 0:
+        logging.info(f"DataFrame columns: {df.columns.tolist()}")
+        logging.info(f"Sample data:\n{df.head()}")
+        
+        if 'label_name' in df.columns:
+            logging.info(f"\nBy label:\n{df.groupby('label_name').size()}")
+        else:
+            logging.error("Column 'label_name' not found in DataFrame!")
+            logging.info(f"Available columns: {df.columns.tolist()}")
+    else:
+        logging.warning("DataFrame is empty - no images found!")
     
     return df
 

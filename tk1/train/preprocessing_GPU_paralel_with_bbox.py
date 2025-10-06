@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 import os
-from datetime import datetime
+from datetime import datetim
 import json
-import warnings
+import warningsuse_superpixel_refine 
 import torch
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
@@ -57,30 +57,30 @@ class TunableConfig:
     def __init__(self):
         # ========== VEGETATION SEGMENTATION ==========
         self.veg_method = 'combined'
-        self.veg_morph_close = (12, 12)  # Balanced mode - giảm từ 13 xuống 12
-        self.veg_morph_open = (7, 7)
-        self.veg_erode = (2, 2)  # Khôi phục erode để chặn viền rò
+        self.veg_morph_close = (11, 11)
+        self.veg_morph_open = (9, 9)
+        self.veg_erode = (4, 4)
         
         # ========== DISEASE COLOR DETECTION (HSV) ==========
         self.disease_color_ranges = {
             'brown_spot': {
-                # H: 7–26, S: 45–255, V: 45–220 (balanced mode)
-                'hsv_lower': np.array([7, 45, 45]),
-                'hsv_upper': np.array([26, 255, 220]),
+                # H: 8–22, S: 60–255, V: 40–210
+                'hsv_lower': np.array([10, 60, 40]),
+                'hsv_upper': np.array([22, 255, 210]),
                 'coverage_threshold': 0.40,
                 'color_variance_max': 40,
             },
             'leaf_blast': {
-                # vùng bạc/xám, bão hòa thấp, sáng: V>=125 (balanced mode)
-                'hsv_lower': np.array([0, 0, 125]),
-                'hsv_upper': np.array([180, 70, 245]),
+                # vùng bạc/xám, bão hòa thấp, sáng: V>=130
+                'hsv_lower': np.array([0, 0, 130]),
+                'hsv_upper': np.array([180, 65, 255]),
                 'coverage_threshold': 0.35,
                 'color_variance_max': 50,
             },
             'leaf_blight': {
-                # vàng nâu dọc bìa lá (balanced mode)
-                'hsv_lower': np.array([17, 40, 55]),
-                'hsv_upper': np.array([38, 255, 220]),
+                # vàng nâu dọc bìa lá
+                'hsv_lower': np.array([17, 45, 55]),
+                'hsv_upper': np.array([35, 255, 220]),
                 'coverage_threshold': 0.45,
                 'color_variance_max': 45,
             }
@@ -89,45 +89,45 @@ class TunableConfig:
         # ========== YELLOW LEAF DETECTION ==========
         self.yellow_hsv_main = ([16, 80, 70], [38, 255, 255])
         self.yellow_hsv_orange = ([5, 80, 60], [20, 255, 255])
-        self.yellow_lab_threshold = 145  # Balanced mode - khôi phục về 145
-        self.yellow_min_area = 240       # Balanced mode - tăng lên 240
+        self.yellow_lab_threshold = 145
+        self.yellow_min_area = 250
         
         # ========== MORPHOLOGY & POST-PROCESSING ==========
         self.disease_morph_kernel = (7, 7)
         self.disease_morph_close_iter = 2
         self.disease_morph_open_iter = 1
-        self.min_region_area = 220      # Balanced mode - tăng lên 220
+        self.min_region_area = 1200      # trước 250
         
         # ========== EDGE DETECTION ==========
-        self.canny_low = 70   # Balanced mode - tăng lên 70
-        self.canny_high = 170 # Balanced mode - tăng lên 170
+        self.canny_low = 80
+        self.canny_high = 180
         self.edge_dilate_kernel = (3, 3)
-        self.edge_dilate_iter = 1  # Balanced mode - giảm về 1
+        self.edge_dilate_iter = 1
         
         # ========== 1. ADAPTIVE K-MEANS LAB ==========
         self.use_adaptive_kmeans = True  # ✅ BẬT
-        self.kmeans_k = 3  # Balanced mode - giảm về 3
+        self.kmeans_k = 3
         self.kmeans_attempts = 3
-        self.kmeans_min_cluster_frac = 0.035  # Balanced mode - tăng lên 0.035
-        self.kmeans_ab_weight = 1.25  # Balanced mode - giảm xuống 1.25
-        self.kmeans_veto_green_h = (38, 95)  # Balanced mode - nới hơn
+        self.kmeans_min_cluster_frac = 0.12
+        self.kmeans_ab_weight = 1.2
+        self.kmeans_veto_green_h = (35, 95)
         
         # ========== 2. LBP TEXTURE ==========
-        self.use_lbp = True  # ✅ BẬT
+        self.use_lbp = False  # ✅ BẬT
         self.lbp_radius = 1
         self.lbp_thresh = 0.12
-        self.lbp_min_area = 240  # Balanced mode - tăng lên 240
+        self.lbp_min_area = 300
         
         # ========== 3. SUPERPIXEL REFINEMENT ==========
-        self.use_superpixel_refine = True  # ✅ BẬT cho balanced mode
-        self.slic_region_size = 18  # Balanced mode - giảm xuống 18
-        self.slic_ruler = 10.0
-        self.slic_min_size = 60     # Balanced mode - tăng lên 60
-        self.superpixel_vote_ratio = 0.75  # Balanced mode - tăng lên 0.75
+        self.use_superpixel_refine = True  # ✅ BẬT
+        self.slic_region_size = 25
+        self.slic_ruler = 12.0
+        self.slic_min_size = 40
+        self.superpixel_vote_ratio = 0.80  # trước 0.55
         
         # ========== 4. SHAPE FILTERS ==========
-        self.shape_min_solidity = 0.45  # Balanced mode - tăng lên 0.45
-        self.shape_max_eccentricity = 0.996  # Balanced mode - giảm xuống 0.996
+        self.shape_min_solidity = 0.5
+        self.shape_max_eccentricity = 0.995
         
         # ========== 5. CLAHE ILLUMINATION ==========
         self.use_clahe = True  # ✅ BẬT
@@ -148,7 +148,7 @@ class TunableConfig:
         self.qc_exposure_acceptable = (50, 200)
         self.qc_edge_optimal = (0.05, 0.3)
         self.qc_edge_acceptable = (0.02, 0.5)
-        self.qc_min_score = 0.55  # Balanced mode - tăng lên 0.55
+        self.qc_min_score = 0.6  # ✅ Giữ nguyên accuracy
         
         # ========== COLOR CONSTANCY ==========
         self.use_color_constancy = True
@@ -275,10 +275,8 @@ class VegetationSegmenter:
         kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, self.config.veg_morph_open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
         
-        # Bỏ erode để giữ ROI lá rộng hơn (recall mode)
-        if self.config.veg_erode != (0, 0):
-            kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, self.config.veg_erode)
-            mask = cv2.erode(mask, kernel_erode)
+        kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, self.config.veg_erode)
+        mask = cv2.erode(mask, kernel_erode)
         
         return mask
 
@@ -356,15 +354,15 @@ class DiseaseSegmenter:
         
         # siết thêm theo Lab từng bệnh
         if disease_type == 'brown_spot':
-            # điểm nâu/đỏ thật sự (balanced mode - siết chặt hơn)
-            a_ok = (lab[:, :, 1] > 132).astype(np.uint8) * 255
-            b_ok = (lab[:, :, 2] > 136).astype(np.uint8) * 255
+            # điểm nâu/đỏ thật sự
+            a_ok = (lab[:, :, 1] > 135).astype(np.uint8) * 255
+            b_ok = (lab[:, :, 2] > 140).astype(np.uint8) * 255
             mask_hsv = cv2.bitwise_and(mask_hsv, a_ok)
             mask_hsv = cv2.bitwise_and(mask_hsv, b_ok)
 
         elif disease_type == 'leaf_blast':
-            # giữ vùng bạc/xám sáng (balanced mode - siết hơn)
-            L_ok = (lab[:, :, 0] < 135).astype(np.uint8) * 255
+            # giữ vùng bạc/xám sáng
+            L_ok = (lab[:, :, 0] < 130).astype(np.uint8) * 255
             mask_hsv = cv2.bitwise_and(mask_hsv, L_ok)
 
         # --- xử lý ROI vàng-lá ---
@@ -372,15 +370,14 @@ class DiseaseSegmenter:
         if vegetation_mask is not None:
             yellow_roi = self._yellow_leaf_roi(image, vegetation_mask)
 
-        # BALANCED MODE: Loại vùng vàng-lá cho brown_spot/leaf_blast để tránh tràn mask
         if disease_type in ['brown_spot', 'leaf_blast']:
-            # LOẠI vàng-lá để giảm false positive
+            # LOẠI vàng-lá
             if yellow_roi is not None:
                 mask_hsv = cv2.bitwise_and(mask_hsv, cv2.bitwise_not(yellow_roi))
 
-        if disease_type == 'leaf_blight':
+        elif disease_type == 'leaf_blight':
             # BẮT BUỘC nằm trong vàng-lá và sát mép lá
-            edge_band = self._edge_band_of_leaf(vegetation_mask, max_dist_px=12)  # Tăng từ 8 lên 12
+            edge_band = self._edge_band_of_leaf(vegetation_mask, max_dist_px=8)
             if yellow_roi is not None:
                 mask_hsv = cv2.bitwise_and(mask_hsv, yellow_roi)
             mask_hsv = cv2.bitwise_and(mask_hsv, edge_band)
@@ -426,11 +423,11 @@ class DiseaseSegmenter:
         # CẢI TIẾN #4: Shape filtering
         mask = self._remove_small_regions(mask, self.config.min_region_area)
         
-        # Bộ lọc texture/độ tương phản cục bộ (nới hơn cho recall mode)
+        # Bộ lọc texture/độ tương phản cục bộ
         g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         local_std = cv2.GaussianBlur(g*g, (0,0), 3) - (cv2.GaussianBlur(g, (0,0), 3))**2
         local_std = np.sqrt(np.clip(local_std, 0, None)).astype(np.float32)
-        std_ok = (local_std > 9).astype(np.uint8) * 255   # Balanced mode - tăng lên 9
+        std_ok = (local_std > 10).astype(np.uint8) * 255   # vùng vàng đều sẽ bị loại
         mask = cv2.bitwise_and(mask, std_ok)
 
         # Eccentricity cho leaf_blast (vệt dài)
@@ -681,7 +678,7 @@ class DiseaseSegmenter:
         y  = cv2.bitwise_or(y1, y2)
 
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        b_ok = (lab[:, :, 2] > 140).astype(np.uint8) * 255  # Giảm từ 145 xuống 140
+        b_ok = (lab[:, :, 2] > 145).astype(np.uint8) * 255
         y = cv2.bitwise_and(y, b_ok)
         y = cv2.bitwise_and(y, vegetation_mask)
         y = self._remove_small_regions(y, 300)
