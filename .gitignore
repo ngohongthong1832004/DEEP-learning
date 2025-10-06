@@ -5,6 +5,9 @@ tk1/*
 !tk1/train/
 !tk1/train/**
 
+!tk1/train_v2/
+!tk1/train_v2/**
+
 # Giữ lại các file code trong tk1 (py, ipynb, md)
 !tk1/*.py
 !tk1/*.ipynb
