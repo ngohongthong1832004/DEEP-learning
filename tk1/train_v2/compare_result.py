@@ -6,7 +6,7 @@ from sklearn.metrics import confusion_matrix, classification_report, accuracy_sc
 
 # ==== ĐIỀN ĐƯỜNG DẪN TẠI ĐÂY ====
 GT_PATH   = r"example_result.csv"   # ví dụ: r"D:\data\gt.csv"
-PRED_PATH = r"/home/bbsw/thong/deep_learning/tk1/output/predict/results/predictions_2025-10-06_13-23-05/predictions_mobilenet_v3_small.csv"    # ví dụ: r"D:\data\pred.csv"
+PRED_PATH = r"/home/bbsw/thong/deep_learning/tk1/train_v2/trí_submission.csv"    # ví dụ: r"D:\data\pred.csv"
 OUT_DIR   = r"/home/bbsw/thong/deep_learning/tk1/output/compare_results"              # ví dụ: r"D:\data\out"
 # =================================
 

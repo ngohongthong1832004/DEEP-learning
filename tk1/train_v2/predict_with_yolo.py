@@ -34,7 +34,7 @@ YOLO_CONFIG = {
 
 # Classifier Config
 OUTPUT_DIRS = {
-    "weights": "../output/multi-model-classifier-v2_2025-10-06_11-48-35/weights",
+    "weights": "../output/thong-result-final-for-change-parameter-1_2025-10-07_01-44-01/weights",
     "results": "../output/predict/results",
     "crops": "../output/predict/crops",  # Lưu crops để debug
 }

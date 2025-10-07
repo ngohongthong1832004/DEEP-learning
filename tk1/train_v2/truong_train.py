@@ -1,6 +1,6 @@
 # %% [markdown]
-# # Multi-Model Rice Disease Classification
-# Train and compare 6 lightweight models (<50M params) optimized for rice leaf disease classification
+# # Multi-Model Rice Disease Classification - 10 Processes on Single GPU
+# Train 10 models simultaneously on GPU 0 using multi-processing
 
 # %%
 # ===== IMPORTS =====
@@ -27,6 +27,11 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms, models
 import cv2
 
+# Multi-processing imports
+import multiprocessing as mp
+from multiprocessing import Process, Queue, Manager
+from concurrent.futures import ProcessPoolExecutor
+
 try:
     from torch.amp import GradScaler, autocast
     _NEW_AMP = True
@@ -36,6 +41,12 @@ except:
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
+
+# Set multiprocessing start method
+try:
+    mp.set_start_method('spawn', force=True)
+except:
+    pass
 
 # %%
 # ===== REPRODUCIBILITY =====
@@ -51,55 +62,35 @@ def seed_everything(seed=42):
 seed_everything(42)
 
 # %%
-# ===== GPU CONFIGURATION =====
-def setup_gpu(gpu_id=0):
-    """Setup GPU with memory optimization"""
-    if torch.cuda.is_available():
-        torch.cuda.set_device(gpu_id)
-        torch.cuda.empty_cache()
-        
-        # Enable TF32 for better performance on Ampere GPUs (RTX 4090)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        # Set memory allocation strategy
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
-        
-        device = torch.device(f'cuda:{gpu_id}')
-        logging.info(f"Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
-        logging.info(f"Total Memory: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.2f} GB")
-        logging.info(f"TF32 enabled: {torch.backends.cuda.matmul.allow_tf32}")
-        
-        return device
-    else:
-        logging.warning("CUDA not available, using CPU")
-        return torch.device('cpu')
-
-# %%
 # ===== CONFIGURATION =====
 CONFIG = {
-    # GPU Settings
-    'gpu_id': 0,  # Use first GPU
-    'prefetch_factor': 2,  # Prefetch batches
-    'persistent_workers': True,  # Keep workers alive
+    # GPU Configuration - SINGLE GPU ONLY
+    'target_gpu': 0,  # Use only GPU 0
+    'num_parallel_processes': 10,  # Train 10 models simultaneously
     
-    # Models to train (all <50M params)
+    # Models to train
     'models': [
-        'mobilenet_v3_small',    # ~2.5M params
-        'mobilenet_v3_large',    # ~5.4M params
-        'efficientnet_b0',       # ~5.3M params
-        'efficientnet_v2_s',     # ~21M params
-        'resnet18',              # ~11M params
-        'shufflenet_v2_x1_0',    # ~2.3M params
+        'mobilenet_v3_small',
+        'mobilenet_v3_large',
+        'efficientnet_b0',
+        'efficientnet_v2_s',
+        'resnet18',
+        'shufflenet_v2_x1_0',
+        'mobilenet_v2',
+        'squeezenet1_1',
+        'densenet121',
+        'resnext50_32x4d',
     ],
     
-    # Training
+    # Training - Optimized for parallel execution on single GPU
     'img_size': 224,
-    'batch_size': 128,  # Optimized for RTX 4090
+    'batch_size': 64,  # Smaller batch per process
     'epochs': 50,
-    'lr': 2e-4,
-    'num_workers': 8,
+    'lr': 3e-4,
+    'num_workers': 2,  # Fewer workers per process
     'pin_memory': True,
+    'prefetch_factor': 2,
+    'persistent_workers': False,
     
     # Model enhancements
     'use_cbam': True,
@@ -111,9 +102,9 @@ CONFIG = {
     'sce_alpha': 0.1,
     'sce_beta': 1.0,
     'use_ema': True,
-    'ema_decay': 0.999,
+    'ema_decay': 0.9995,
     'use_mixup': True,
-    'mixup_alpha': 0.2,
+    'mixup_alpha': 0.3,
     'use_cutmix': True,
     'cutmix_alpha': 1.0,
     
@@ -123,7 +114,7 @@ CONFIG = {
     'clahe_tile_size': (8, 8),
     
     # Early stopping
-    'patience': 15,
+    'patience': 12,
     
     # Data splits
     'val_size': 0.15,
@@ -146,7 +137,7 @@ def get_output_folder(parent_dir: str, env_name: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
-PATH_OUTPUT = get_output_folder("../output", "multi-model-classifier-optimized")
+PATH_OUTPUT = get_output_folder("../output", "10-processes-single-gpu")
 
 def create_output_structure(base_path):
     folders = ["weights", "results", "plots", "logs", "demo", "comparison"]
@@ -156,45 +147,34 @@ def create_output_structure(base_path):
 
 OUTPUT_DIRS = create_output_structure(PATH_OUTPUT)
 
-def setup_logging(output_path):
-    log_file = os.path.join(output_path, "logs", "training.log")
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    return logger
-
-logger = setup_logging(PATH_OUTPUT)
-
-# Setup GPU
-DEVICE = setup_gpu(CONFIG['gpu_id'])
-
 # %%
 # ===== LABELS =====
 LABELS = {
-    0: {"name": "brown_spot", "match_substrings": [
-        "../data_total/brown_spot",
-    ]},
-    1: {"name": "leaf_blast", "match_substrings": [
-        "../data_total/blast",
-    ]},
-    2: {"name": "leaf_blight", "match_substrings": [
-        "../data_total/bacterial_leaf_blight",
-    ]},
-    3: {"name": "healthy", "match_substrings": [
-        "../data_total/normal",
-    ]},
+    0: {"name": "brown_spot", "match_substrings": ["../data_total/brown_spot"]},
+    1: {"name": "leaf_blast", "match_substrings": ["../data_total/blast"]},
+    2: {"name": "leaf_blight", "match_substrings": ["../data_total/bacterial_leaf_blight"]},
+    3: {"name": "healthy", "match_substrings": ["../data_total/normal"]},
 }
+
+# %%
+# ===== GPU SETUP =====
+def setup_gpu(gpu_id=0):
+    """Setup specific GPU"""
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+        torch.cuda.empty_cache()
+        
+        # Enable optimizations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
+        
+        device = torch.device(f'cuda:{gpu_id}')
+        return device
+    else:
+        return torch.device('cpu')
 
 # %% [markdown]
 # ## MODEL COMPONENTS
@@ -245,7 +225,6 @@ class CBAM(nn.Module):
         x = self.spatial_att(x)
         return x
 
-# ===== ENHANCED HEAD =====
 class EnhancedHead(nn.Module):
     def __init__(self, in_features, num_classes, dropout=0.3):
         super().__init__()
@@ -273,7 +252,6 @@ class EnhancedHead(nn.Module):
 def build_classifier(backbone_name: str, num_classes: int):
     """Build classifier with specified backbone"""
     
-    # Get backbone and feature channels
     if backbone_name == 'mobilenet_v3_small':
         from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
@@ -316,19 +294,44 @@ def build_classifier(backbone_name: str, num_classes: int):
         features = nn.Sequential(*list(base_model.children())[:-2])
         feat_channels = 1024
         
+    elif backbone_name == 'mobilenet_v2':
+        from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+        weights = MobileNet_V2_Weights.IMAGENET1K_V1
+        base_model = mobilenet_v2(weights=weights)
+        features = base_model.features
+        feat_channels = 1280
+        
+    elif backbone_name == 'squeezenet1_1':
+        from torchvision.models import squeezenet1_1, SqueezeNet1_1_Weights
+        weights = SqueezeNet1_1_Weights.IMAGENET1K_V1
+        base_model = squeezenet1_1(weights=weights)
+        features = base_model.features
+        feat_channels = 512
+        
+    elif backbone_name == 'densenet121':
+        from torchvision.models import densenet121, DenseNet121_Weights
+        weights = DenseNet121_Weights.IMAGENET1K_V1
+        base_model = densenet121(weights=weights)
+        features = base_model.features
+        feat_channels = 1024
+        
+    elif backbone_name == 'resnext50_32x4d':
+        from torchvision.models import resnext50_32x4d, ResNeXt50_32X4D_Weights
+        weights = ResNeXt50_32X4D_Weights.IMAGENET1K_V1
+        base_model = resnext50_32x4d(weights=weights)
+        features = nn.Sequential(*list(base_model.children())[:-2])
+        feat_channels = 2048
+        
     else:
         raise ValueError(f"Unknown backbone: {backbone_name}")
     
-    # Add CBAM if enabled
     if CONFIG['use_cbam']:
         cbam = CBAM(feat_channels, reduction=16)
         features = nn.Sequential(*list(features.children()), cbam)
     
-    # Build model
     model = nn.Module()
     model.features = features
     
-    # Add classification head
     if CONFIG['use_better_head']:
         model.head = EnhancedHead(feat_channels, num_classes, dropout=0.3)
     else:
@@ -345,7 +348,6 @@ def build_classifier(backbone_name: str, num_classes: int):
     
     model.forward = _forward.__get__(model, type(model))
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
@@ -365,25 +367,25 @@ def collect_images_from_path(path: str) -> List[str]:
             if file.endswith(image_extensions):
                 images.append(os.path.join(path, file))
     except Exception as e:
-        logging.warning(f"Error reading {path}: {e}")
+        print(f"Error reading {path}: {e}")
     return images
 
 def auto_collect_dataset():
-    logging.info("="*60)
-    logging.info("DATA COLLECTION")
-    logging.info("="*60)
+    print("="*60)
+    print("DATA COLLECTION")
+    print("="*60)
     
     all_data = []
     for label_id, label_info in LABELS.items():
         label_name = label_info['name']
         match_paths = label_info['match_substrings']
         
-        logging.info(f"\nCollecting {label_name} (ID: {label_id})...")
+        print(f"\nCollecting {label_name} (ID: {label_id})...")
         
         for path in match_paths:
             images = collect_images_from_path(path)
             if len(images) > 0:
-                logging.info(f"  ✓ {len(images)} images from {path}")
+                print(f"  ✓ {len(images)} images from {path}")
                 for img_path in images:
                     all_data.append({
                         'image_path': img_path,
@@ -392,15 +394,14 @@ def auto_collect_dataset():
                     })
     
     df = pd.DataFrame(all_data)
-    logging.info(f"\nTotal: {len(df)} images")
-    logging.info(f"\nBy label:\n{df.groupby('label_name').size()}")
+    print(f"\nTotal: {len(df)} images")
+    print(f"\nBy label:\n{df.groupby('label_name').size()}")
     
     return df
 
 collected_df = auto_collect_dataset()
 collected_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "collected_images.csv"), index=False)
 
-# %%
 # Split data
 train_val_df, test_df = train_test_split(
     collected_df, test_size=CONFIG['test_size'], random_state=42, stratify=collected_df['label_id']
@@ -410,10 +411,15 @@ train_df, val_df = train_test_split(
     random_state=42, stratify=train_val_df['label_id']
 )
 
-logging.info(f"\nData splits:")
-logging.info(f"Train: {len(train_df)} ({len(train_df)/len(collected_df)*100:.1f}%)")
-logging.info(f"Val:   {len(val_df)} ({len(val_df)/len(collected_df)*100:.1f}%)")
-logging.info(f"Test:  {len(test_df)} ({len(test_df)/len(collected_df)*100:.1f}%)")
+print(f"\nData splits:")
+print(f"Train: {len(train_df)} ({len(train_df)/len(collected_df)*100:.1f}%)")
+print(f"Val:   {len(val_df)} ({len(val_df)/len(collected_df)*100:.1f}%)")
+print(f"Test:  {len(test_df)} ({len(test_df)/len(collected_df)*100:.1f}%)")
+
+# Save splits
+train_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "train_split.csv"), index=False)
+val_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "val_split.csv"), index=False)
+test_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "test_split.csv"), index=False)
 
 # %% [markdown]
 # ## TRAINING COMPONENTS
@@ -436,7 +442,6 @@ class SymmetricCrossEntropy(nn.Module):
 
 # ===== MIXUP & CUTMIX =====
 def mixup_data(x, y, alpha=0.2):
-    """Apply mixup augmentation"""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
@@ -450,7 +455,6 @@ def mixup_data(x, y, alpha=0.2):
     return mixed_x, y_a, y_b, lam
 
 def cutmix_data(x, y, alpha=1.0):
-    """Apply CutMix augmentation"""
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
@@ -462,20 +466,17 @@ def cutmix_data(x, y, alpha=1.0):
     bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
     x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
     
-    # Adjust lambda to exactly match pixel ratio
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
     y_a, y_b = y, y[index]
     return x, y_a, y_b, lam
 
 def rand_bbox(size, lam):
-    """Generate random bounding box for CutMix"""
     W = size[2]
     H = size[3]
     cut_rat = np.sqrt(1. - lam)
     cut_w = int(W * cut_rat)
     cut_h = int(H * cut_rat)
     
-    # Uniform
     cx = np.random.randint(W)
     cy = np.random.randint(H)
     
@@ -487,7 +488,6 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    """Mixup/CutMix loss"""
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 # ===== EMA =====
@@ -507,32 +507,20 @@ class ModelEMA:
             else:
                 v.copy_(msd[k])
 
-# ===== CLAHE TRANSFORM =====
+# ===== CLAHE TRANSFORM (FIXED FOR MULTIPROCESSING) =====
 class CLAHETransform:
-    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to PIL Images"""
-    
     def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
         self.clip_limit = clip_limit
         self.tile_grid_size = tile_grid_size
-        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
     
     def __call__(self, pil_image):
-        # Convert PIL to numpy array
+        clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=self.tile_grid_size)
+        
         img_array = np.array(pil_image)
-        
-        # Convert RGB to LAB color space
         lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
-        
-        # Apply CLAHE to L channel
-        lab[:, :, 0] = self.clahe.apply(lab[:, :, 0])
-        
-        # Convert back to RGB
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-        
         return Image.fromarray(enhanced.astype(np.uint8))
-    
-    def __repr__(self):
-        return f"CLAHETransform(clip_limit={self.clip_limit}, tile_grid_size={self.tile_grid_size})"
 
 # ===== DATASET =====
 class ImageDataset(Dataset):
@@ -553,12 +541,9 @@ class ImageDataset(Dataset):
 
 # ===== TRANSFORMS =====
 def get_transforms(size):
-    """Get training and validation transforms with optional CLAHE preprocessing"""
-    
     base_train_transforms = []
     base_val_transforms = []
     
-    # Add CLAHE if enabled
     if CONFIG['use_clahe']:
         clahe_transform = CLAHETransform(
             clip_limit=CONFIG['clahe_clip_limit'],
@@ -566,33 +551,26 @@ def get_transforms(size):
         )
         base_train_transforms.append(clahe_transform)
         base_val_transforms.append(clahe_transform)
-        logging.info(f"CLAHE enabled: clip_limit={CONFIG['clahe_clip_limit']}, tile_size={CONFIG['clahe_tile_size']}")
     
-    # Training transforms
     train_transforms = base_train_transforms + [
         transforms.RandomResizedCrop(size, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(p=0.3),
         transforms.RandomRotation(20),
         transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.TrivialAugmentWide(num_magnitude_bins=31),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         transforms.RandomErasing(p=0.2),
     ]
     
-    # Validation transforms
     val_transforms = base_val_transforms + [
         transforms.Resize((size, size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]
     
-    train_transform = transforms.Compose(train_transforms)
-    val_transform = transforms.Compose(val_transforms)
-    
-    return train_transform, val_transform
+    return transforms.Compose(train_transforms), transforms.Compose(val_transforms)
 
 # ===== DATA LOADERS =====
 def make_loader(df, transform, batch_size, train=True):
@@ -605,10 +583,8 @@ def make_loader(df, transform, batch_size, train=True):
         'drop_last': train,
     }
     
-    # Add prefetch and persistent workers for better performance
-    if CONFIG['num_workers'] > 0:
+    if CONFIG['num_workers'] > 0 and CONFIG.get('prefetch_factor'):
         loader_kwargs['prefetch_factor'] = CONFIG['prefetch_factor']
-        loader_kwargs['persistent_workers'] = CONFIG['persistent_workers']
     
     if train and CONFIG['use_weighted_sampler']:
         counts = df['label_id'].value_counts().sort_index().values.astype(float)
@@ -619,435 +595,347 @@ def make_loader(df, transform, batch_size, train=True):
     else:
         loader_kwargs['shuffle'] = train
     
-    loader = DataLoader(dataset, **loader_kwargs)
-    
-    return loader
+    return DataLoader(dataset, **loader_kwargs)
 
 # %% [markdown]
-# ## TRAINING FUNCTION
+# ## MULTI-PROCESS TRAINING ON SINGLE GPU
 
 # %%
-def train_single_model(model_name: str, train_df, val_df, epochs):
-    """Train a single model with optimizations"""
+def train_model_process(model_name, gpu_id, process_id, result_queue, config, output_dirs):
+    """Train a single model in isolated process on specified GPU"""
     
-    logging.info("\n" + "="*80)
-    logging.info(f"TRAINING: {model_name}")
-    logging.info("="*80)
-    
-    device = DEVICE
-    num_classes = len(LABELS)
-    
-    # Build model
-    model, total_params, trainable_params = build_classifier(model_name, num_classes)
-    model = model.to(device)
-    
-    logging.info(f"Total params: {total_params:,} ({total_params/1e6:.2f}M)")
-    logging.info(f"Trainable params: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
-    
-    # Setup AMP
-    use_cuda = torch.cuda.is_available()
-    if _NEW_AMP:
-        amp_ctx = autocast(device_type="cuda", enabled=use_cuda)
-        scaler = GradScaler(device="cuda" if use_cuda else "cpu", enabled=use_cuda)
-    else:
-        from contextlib import nullcontext
-        amp_ctx = autocast(enabled=use_cuda) if use_cuda else nullcontext()
-        scaler = GradScaler(enabled=use_cuda)
-    
-    # Loss
-    if CONFIG['use_sce_loss']:
-        criterion = SymmetricCrossEntropy(CONFIG['sce_alpha'], CONFIG['sce_beta'], num_classes)
-    else:
-        criterion = nn.CrossEntropyLoss()
-    
-    # Prepare loaders
-    train_transform, val_transform = get_transforms(CONFIG['img_size'])
-    train_loader = make_loader(train_df, train_transform, CONFIG['batch_size'], train=True)
-    val_loader = make_loader(val_df, val_transform, CONFIG['batch_size'], train=False)
-    
-    # Optimizer & Scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-4)
-    steps_per_epoch = len(train_loader)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=CONFIG['lr'],
-        epochs=epochs,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.1,
-        anneal_strategy='cos'
-    )
-    
-    # EMA
-    ema = ModelEMA(model, decay=CONFIG['ema_decay']) if CONFIG['use_ema'] else None
-    
-    best_val_acc = 0.0
-    bad_epochs = 0
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    best_path = os.path.join(OUTPUT_DIRS["weights"], f"{model_name}_best.pth")
-    
-    for epoch in range(1, epochs + 1):
-        # ===== TRAIN =====
-        model.train()
-        epoch_loss, correct, total = 0.0, 0, 0
+    try:
+        # Set random seed
+        seed = 42 + process_id
+        seed_everything(seed)
         
-        pbar = tqdm(train_loader, desc=f"[{model_name}] Epoch {epoch}/{epochs}")
-        for batch_idx, (imgs, labels) in enumerate(pbar):
-            imgs = imgs.to(device)
-            labels = labels.long().to(device)
+        # Setup GPU
+        device = setup_gpu(gpu_id)
+        
+        print(f"\n[Process {process_id}] [GPU {gpu_id}] Starting {model_name}")
+        
+        # Load data
+        train_df = pd.read_csv(os.path.join(output_dirs["results"], "train_split.csv"))
+        val_df = pd.read_csv(os.path.join(output_dirs["results"], "val_split.csv"))
+        
+        num_classes = len(LABELS)
+        
+        # Build model
+        model, total_params, trainable_params = build_classifier(model_name, num_classes)
+        model = model.to(device)
+        
+        print(f"[Process {process_id}] {model_name} - Params: {total_params/1e6:.2f}M")
+        
+        # Setup AMP
+        use_cuda = torch.cuda.is_available()
+        if _NEW_AMP:
+            amp_ctx = autocast(device_type="cuda", enabled=use_cuda)
+            scaler = GradScaler(device="cuda" if use_cuda else "cpu", enabled=use_cuda)
+        else:
+            from contextlib import nullcontext
+            amp_ctx = autocast(enabled=use_cuda) if use_cuda else nullcontext()
+            scaler = GradScaler(enabled=use_cuda)
+        
+        # Loss
+        if config['use_sce_loss']:
+            criterion = SymmetricCrossEntropy(config['sce_alpha'], config['sce_beta'], num_classes)
+        else:
+            criterion = nn.CrossEntropyLoss()
+        
+        # Prepare loaders
+        train_transform, val_transform = get_transforms(config['img_size'])
+        train_loader = make_loader(train_df, train_transform, config['batch_size'], train=True)
+        val_loader = make_loader(val_df, val_transform, config['batch_size'], train=False)
+        
+        # Optimizer & Scheduler
+        optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=1e-4)
+        steps_per_epoch = len(train_loader)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config['lr'],
+            epochs=config['epochs'],
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.1,
+            anneal_strategy='cos'
+        )
+        
+        # EMA
+        ema = ModelEMA(model, decay=config['ema_decay']) if config['use_ema'] else None
+        
+        best_val_acc = 0.0
+        bad_epochs = 0
+        history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+        best_path = os.path.join(output_dirs["weights"], f"{model_name}_best.pth")
+        
+        start_time = time.time()
+        
+        for epoch in range(1, config['epochs'] + 1):
+            # TRAIN
+            model.train()
+            epoch_loss, correct, total = 0.0, 0, 0
             
-            optimizer.zero_grad()
-            
-            # Apply augmentation (mixup or cutmix)
-            use_aug = random.random() < 0.5
-            if use_aug:
-                if CONFIG['use_mixup'] and random.random() < 0.5:
-                    imgs, labels_a, labels_b, lam = mixup_data(imgs, labels, CONFIG['mixup_alpha'])
-                    aug_type = 'mixup'
-                elif CONFIG['use_cutmix']:
-                    imgs, labels_a, labels_b, lam = cutmix_data(imgs, labels, CONFIG['cutmix_alpha'])
-                    aug_type = 'cutmix'
-                else:
-                    use_aug = False
-            
-            with amp_ctx:
-                logits = model(imgs)
+            for batch_idx, (imgs, labels) in enumerate(train_loader):
+                imgs = imgs.to(device, non_blocking=True)
+                labels = labels.long().to(device, non_blocking=True)
+                
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Apply augmentation
+                use_aug = random.random() < 0.5
                 if use_aug:
-                    loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
-                else:
-                    loss = criterion(logits, labels)
-            
-            # Gradient accumulation
-            loss = loss / CONFIG['gradient_accumulation_steps']
-            scaler.scale(loss).backward()
-            
-            if (batch_idx + 1) % CONFIG['gradient_accumulation_steps'] == 0:
+                    if config['use_mixup'] and random.random() < 0.5:
+                        imgs, labels_a, labels_b, lam = mixup_data(imgs, labels, config['mixup_alpha'])
+                    elif config['use_cutmix']:
+                        imgs, labels_a, labels_b, lam = cutmix_data(imgs, labels, config['cutmix_alpha'])
+                    else:
+                        use_aug = False
+                
+                with amp_ctx:
+                    logits = model(imgs)
+                    if use_aug:
+                        loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
+                    else:
+                        loss = criterion(logits, labels)
+                
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 
                 if ema is not None:
                     ema.update(model)
-            
-            epoch_loss += loss.item() * imgs.size(0) * CONFIG['gradient_accumulation_steps']
-            pred = logits.argmax(1)
-            correct += (pred == labels).sum().item()
-            total += imgs.size(0)
-            
-            # Memory management
-            if batch_idx % CONFIG['empty_cache_every_n_batches'] == 0:
-                torch.cuda.empty_cache()
-            
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{correct/total:.4f}',
-                'lr': f'{scheduler.get_last_lr()[0]:.6f}'
-            })
-        
-        train_loss = epoch_loss / total
-        train_acc = correct / total
-        
-        # ===== VALIDATE =====
-        eval_model = ema.ema if (ema is not None) else model
-        eval_model.eval()
-        vloss, vcorrect, vtotal = 0.0, 0, 0
-        
-        with torch.no_grad():
-            for imgs, labels in val_loader:
-                imgs = imgs.to(device)
-                labels = labels.long().to(device)
                 
-                with amp_ctx:
-                    logits = eval_model(imgs)
-                    loss = F.cross_entropy(logits, labels)
+                epoch_loss += loss.item() * imgs.size(0)
+                pred = logits.argmax(1)
+                correct += (pred == labels).sum().item()
+                total += imgs.size(0)
                 
-                vloss += loss.item() * imgs.size(0)
-                vcorrect += (logits.argmax(1) == labels).sum().item()
-                vtotal += imgs.size(0)
+                if batch_idx % config['empty_cache_every_n_batches'] == 0:
+                    torch.cuda.empty_cache()
+            
+            train_loss = epoch_loss / total
+            train_acc = correct / total
+            
+            # VALIDATE
+            eval_model = ema.ema if (ema is not None) else model
+            eval_model.eval()
+            vloss, vcorrect, vtotal = 0.0, 0, 0
+            
+            with torch.no_grad():
+                for imgs, labels in val_loader:
+                    imgs = imgs.to(device, non_blocking=True)
+                    labels = labels.long().to(device, non_blocking=True)
+                    
+                    with amp_ctx:
+                        logits = eval_model(imgs)
+                        loss = F.cross_entropy(logits, labels)
+                    
+                    vloss += loss.item() * imgs.size(0)
+                    vcorrect += (logits.argmax(1) == labels).sum().item()
+                    vtotal += imgs.size(0)
+            
+            val_loss = vloss / vtotal
+            val_acc = vcorrect / vtotal
+            
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+            
+            if epoch % 5 == 0 or epoch == 1:
+                print(f"[P{process_id}] [{model_name}] Epoch {epoch}/{config['epochs']}: "
+                      f"TL={train_loss:.4f} TA={train_acc:.4f} | VL={val_loss:.4f} VA={val_acc:.4f}")
+            
+            # Save best
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                bad_epochs = 0
+                torch.save({
+                    'model_state_dict': eval_model.state_dict(),
+                    'epoch': epoch,
+                    'val_acc': val_acc,
+                    'model_name': model_name,
+                }, best_path)
+            else:
+                bad_epochs += 1
+                if bad_epochs >= config['patience']:
+                    print(f"[P{process_id}] [{model_name}] Early stopping at epoch {epoch}")
+                    break
         
-        val_loss = vloss / vtotal
-        val_acc = vcorrect / vtotal
+        training_time = time.time() - start_time
         
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
+        # Clean up
+        del model, optimizer, scheduler
+        if ema is not None:
+            del ema
+        torch.cuda.empty_cache()
+        gc.collect()
         
-        logging.info(f"[{model_name}] Epoch {epoch}: TL={train_loss:.4f} TA={train_acc:.4f} | VL={val_loss:.4f} VA={val_acc:.4f}")
+        result = {
+            'model_name': model_name,
+            'gpu_id': gpu_id,
+            'process_id': process_id,
+            'history': history,
+            'checkpoint': best_path,
+            'best_val_acc': best_val_acc,
+            'training_time': training_time,
+            'total_params': total_params,
+            'status': 'success'
+        }
         
-        # Save best
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            bad_epochs = 0
-            torch.save({
-                'model_state_dict': eval_model.state_dict(),
-                'epoch': epoch,
-                'val_acc': val_acc,
-                'model_name': model_name,
-            }, best_path)
-            logging.info(f"  → Saved best (Val Acc {val_acc:.4f})")
-        else:
-            bad_epochs += 1
-            if bad_epochs >= CONFIG['patience']:
-                logging.info(f"[{model_name}] Early stopping triggered")
-                break
+        result_queue.put(result)
+        print(f"[P{process_id}] ✓ {model_name} completed - Val Acc: {best_val_acc:.4f} - Time: {training_time/60:.1f}min")
+        
+    except Exception as e:
+        print(f"[P{process_id}] ✗ {model_name} failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        result = {
+            'model_name': model_name,
+            'gpu_id': gpu_id,
+            'process_id': process_id,
+            'status': 'failed',
+            'error': str(e)
+        }
+        result_queue.put(result)
+
+def train_models_multiprocess_single_gpu(models_list, config, output_dirs):
+    """Train multiple models on single GPU using processes"""
     
-    # Clean up
-    del model, optimizer, scheduler
-    if ema is not None:
-        del ema
-    torch.cuda.empty_cache()
-    gc.collect()
+    print("\n" + "="*80)
+    print("MULTI-PROCESS TRAINING ON SINGLE GPU")
+    print(f"Training {len(models_list)} models on GPU {config['target_gpu']}")
+    print(f"Number of parallel processes: {config['num_parallel_processes']}")
+    print("="*80)
     
-    return history, best_path, best_val_acc
+    # Create result queue
+    manager = Manager()
+    result_queue = manager.Queue()
+    
+    # All models go to the same GPU
+    gpu_id = config['target_gpu']
+    
+    print("\nProcess Assignments:")
+    for idx, model_name in enumerate(models_list):
+        print(f"  Process {idx}: {model_name} → GPU {gpu_id}")
+    
+    # Start all processes
+    processes = []
+    for idx, model_name in enumerate(models_list):
+        p = Process(
+            target=train_model_process,
+            args=(model_name, gpu_id, idx, result_queue, config, output_dirs)
+        )
+        p.start()
+        processes.append(p)
+        time.sleep(1)  # Stagger starts slightly
+    
+    # Wait for all processes
+    for p in processes:
+        p.join()
+    
+    # Collect results
+    results = {}
+    while not result_queue.empty():
+        result = result_queue.get()
+        results[result['model_name']] = result
+    
+    print("\n" + "="*80)
+    print("MULTI-PROCESS TRAINING COMPLETED")
+    print("="*80)
+    
+    # Summary
+    successful = [k for k, v in results.items() if v.get('status') == 'success']
+    failed = [k for k, v in results.items() if v.get('status') == 'failed']
+    
+    print(f"\nSuccessful: {len(successful)}/{len(models_list)}")
+    if successful:
+        print("Models completed:")
+        for model_name in successful:
+            result = results[model_name]
+            print(f"  ✓ {model_name}: Val Acc={result['best_val_acc']:.4f}, "
+                  f"Time={result['training_time']/60:.1f}min")
+    
+    if failed:
+        print(f"\nFailed: {len(failed)}/{len(models_list)}")
+        for model_name in failed:
+            print(f"  ✗ {model_name}: {results[model_name].get('error', 'Unknown')}")
+    
+    return results
 
 # %% [markdown]
-# ## TESTING FUNCTION
+# ## MAIN EXECUTION
 
 # %%
-def benchmark_model(model_name: str, checkpoint_path: str, device, num_warmup=20, num_runs=100):
-    """Benchmark model for FPS and inference time"""
+if __name__ == '__main__':
+    print("\n" + "="*80)
+    print("10 PROCESSES ON SINGLE GPU TRAINING")
+    print(f"Target GPU: {CONFIG['target_gpu']}")
+    print(f"Models to train: {len(CONFIG['models'])}")
+    print(f"Parallel processes: {CONFIG['num_parallel_processes']}")
+    print("="*80)
     
-    num_classes = len(LABELS)
-    model, total_params, _ = build_classifier(model_name, num_classes)
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-    
-    # Create dummy input
-    dummy_input = torch.randn(1, 3, CONFIG['img_size'], CONFIG['img_size']).to(device)
-    
-    # Warmup
-    with torch.no_grad():
-        for _ in range(num_warmup):
-            _ = model(dummy_input)
-    
-    # Benchmark
-    torch.cuda.synchronize() if device.type == 'cuda' else None
     start_time = time.time()
     
-    with torch.no_grad():
-        for _ in range(num_runs):
-            _ = model(dummy_input)
-    
-    torch.cuda.synchronize() if device.type == 'cuda' else None
-    end_time = time.time()
-    
-    total_time = end_time - start_time
-    avg_inference_time = (total_time / num_runs) * 1000  # Convert to ms
-    fps = num_runs / total_time
-    
-    del model
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    return {
-        'fps': fps,
-        'inference_time_ms': avg_inference_time,
-        'total_params': total_params
-    }
-
-def test_model(model_name: str, checkpoint_path: str, test_df, device):
-    """Test a single model"""
-    
-    num_classes = len(LABELS)
-    model, _, _ = build_classifier(model_name, num_classes)
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-    
-    _, val_transform = get_transforms(CONFIG['img_size'])
-    test_loader = make_loader(test_df, val_transform, CONFIG['batch_size'], train=False)
-    
-    all_preds, all_labels, all_probs = [], [], []
-    
-    with torch.no_grad():
-        for imgs, labels in tqdm(test_loader, desc=f"Testing {model_name}"):
-            imgs = imgs.to(device)
-            outputs = model(imgs)
-            probs = F.softmax(outputs, dim=1)
-            
-            all_probs.append(probs.cpu().numpy())
-            all_preds.append(outputs.argmax(1).cpu().numpy())
-            all_labels.append(labels.numpy())
-    
-    y_pred = np.concatenate(all_preds)
-    y_true = np.concatenate(all_labels)
-    y_probs = np.concatenate(all_probs)
-    
-    acc = accuracy_score(y_true, y_pred)
-    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='macro', zero_division=0)
-    cm = confusion_matrix(y_true, y_pred)
-    
-    # Clean up
-    del model
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    return {
-        'accuracy': acc,
-        'precision': p,
-        'recall': r,
-        'f1': f1,
-        'confusion_matrix': cm,
-        'y_true': y_true,
-        'y_pred': y_pred,
-        'y_probs': y_probs
-    }
-
-# %% [markdown]
-# ## TRAIN ALL MODELS
-
-# %%
-# Train all models
-all_histories = {}
-all_checkpoints = {}
-all_best_val_accs = {}
-
-for model_name in CONFIG['models']:
-    history, checkpoint, best_val_acc = train_single_model(
-        model_name, train_df, val_df, CONFIG['epochs']
+    training_results = train_models_multiprocess_single_gpu(
+        CONFIG['models'],
+        CONFIG,
+        OUTPUT_DIRS
     )
-    all_histories[model_name] = history
-    all_checkpoints[model_name] = checkpoint
-    all_best_val_accs[model_name] = best_val_acc
     
-    logging.info(f"\n✓ {model_name} completed - Best Val Acc: {best_val_acc:.4f}\n")
-
-# %% [markdown]
-# ## TEST ALL MODELS
-
-# %%
-# Test all models
-all_test_metrics = {}
-
-logging.info("\n" + "="*80)
-logging.info("TESTING ALL MODELS")
-logging.info("="*80)
-
-for model_name in CONFIG['models']:
-    test_metrics = test_model(
-        model_name, all_checkpoints[model_name], test_df, DEVICE
-    )
-    all_test_metrics[model_name] = test_metrics
+    total_time = time.time() - start_time
     
-    logging.info(f"\n{model_name}:")
-    logging.info(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
-    logging.info(f"  Precision: {test_metrics['precision']:.4f}")
-    logging.info(f"  Recall:    {test_metrics['recall']:.4f}")
-    logging.info(f"  F1 Score:  {test_metrics['f1']:.4f}")
-
-# %% [markdown]
-# ## ENSEMBLE PREDICTION
-
-# %%
-def ensemble_predict(all_probs_dict):
-    """Ensemble prediction using average probabilities"""
-    all_probs = np.stack([probs for probs in all_probs_dict.values()])
-    avg_probs = np.mean(all_probs, axis=0)
-    ensemble_preds = np.argmax(avg_probs, axis=1)
-    return ensemble_preds, avg_probs
-
-if CONFIG['use_ensemble'] and len(CONFIG['models']) > 1:
-    logging.info("\n" + "="*80)
-    logging.info("ENSEMBLE PREDICTION")
-    logging.info("="*80)
+    print(f"\n{'='*80}")
+    print(f"TOTAL TRAINING TIME: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
+    print(f"Average time per model: {total_time/len(CONFIG['models'])/60:.1f} minutes")
+    print(f"{'='*80}")
     
-    all_probs_dict = {name: metrics['y_probs'] for name, metrics in all_test_metrics.items()}
-    y_true = all_test_metrics[CONFIG['models'][0]]['y_true']
+    # Extract successful results
+    all_histories = {}
+    all_checkpoints = {}
+    all_best_val_accs = {}
     
-    ensemble_preds, ensemble_probs = ensemble_predict(all_probs_dict)
+    for model_name, result in training_results.items():
+        if result.get('status') == 'success':
+            all_histories[model_name] = result['history']
+            all_checkpoints[model_name] = result['checkpoint']
+            all_best_val_accs[model_name] = result['best_val_acc']
     
-    acc = accuracy_score(y_true, ensemble_preds)
-    p, r, f1, _ = precision_recall_fscore_support(y_true, ensemble_preds, average='macro', zero_division=0)
-    cm = confusion_matrix(y_true, ensemble_preds)
+    print(f"\nSuccessfully trained {len(all_checkpoints)} models")
     
-    ensemble_metrics = {
-        'accuracy': acc,
-        'precision': p,
-        'recall': r,
-        'f1': f1,
-        'confusion_matrix': cm,
-        'y_true': y_true,
-        'y_pred': ensemble_preds,
-        'y_probs': ensemble_probs
-    }
+    # Save training summary
+    summary_data = []
+    for model_name, result in training_results.items():
+        if result.get('status') == 'success':
+            summary_data.append({
+                'Model': model_name,
+                'GPU': result['gpu_id'],
+                'Process_ID': result['process_id'],
+                'Best_Val_Acc': f"{result['best_val_acc']:.4f}",
+                'Training_Time_min': f"{result['training_time']/60:.1f}",
+                'Parameters_M': f"{result['total_params']/1e6:.2f}",
+                'Status': 'Success'
+            })
+        else:
+            summary_data.append({
+                'Model': model_name,
+                'GPU': result.get('gpu_id', '-'),
+                'Process_ID': result.get('process_id', '-'),
+                'Best_Val_Acc': '-',
+                'Training_Time_min': '-',
+                'Parameters_M': '-',
+                'Status': f"Failed: {result.get('error', 'Unknown')[:50]}"
+            })
     
-    all_test_metrics['ensemble'] = ensemble_metrics
+    summary_df = pd.DataFrame(summary_data)
+    summary_path = os.path.join(OUTPUT_DIRS["results"], "training_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
     
-    logging.info(f"\nEnsemble Results:")
-    logging.info(f"  Accuracy:  {acc:.4f}")
-    logging.info(f"  Precision: {p:.4f}")
-    logging.info(f"  Recall:    {r:.4f}")
-    logging.info(f"  F1 Score:  {f1:.4f}")
-
-# %% [markdown]
-# ## BENCHMARK & RESULTS
-
-# %%
-# Benchmark all models
-all_benchmarks = {}
-logging.info("\n" + "="*60)
-logging.info("BENCHMARKING MODELS")
-logging.info("="*60)
-
-for model_name in CONFIG['models']:
-    logging.info(f"Benchmarking {model_name}...")
-    benchmark = benchmark_model(model_name, all_checkpoints[model_name], DEVICE)
-    all_benchmarks[model_name] = benchmark
-    logging.info(f"  FPS: {benchmark['fps']:.1f}, Inference: {benchmark['inference_time_ms']:.2f}ms")
-
-# Create comprehensive results summary
-results_summary = []
-class_names = [LABELS[i]['name'] for i in sorted(LABELS.keys())]
-
-for model_name in CONFIG['models']:
-    metrics = all_test_metrics[model_name]
-    benchmark = all_benchmarks[model_name]
+    print("\n" + "="*80)
+    print("TRAINING SUMMARY")
+    print("="*80)
+    print(summary_df.to_string(index=False))
     
-    result_row = {
-        'Model': model_name,
-        'Parameters_M': f"{benchmark['total_params']/1e6:.2f}",
-        'FPS': f"{benchmark['fps']:.1f}",
-        'Inference_Time_ms': f"{benchmark['inference_time_ms']:.2f}",
-        'Best_Val_Acc': f"{all_best_val_accs[model_name]:.4f}",
-        'Test_Accuracy': f"{metrics['accuracy']:.4f}",
-        'Test_Precision': f"{metrics['precision']:.4f}",
-        'Test_Recall': f"{metrics['recall']:.4f}",
-        'Test_F1': f"{metrics['f1']:.4f}",
-    }
-    results_summary.append(result_row)
-
-if 'ensemble' in all_test_metrics:
-    metrics = all_test_metrics['ensemble']
-    result_row = {
-        'Model': 'ensemble',
-        'Parameters_M': f"{sum(all_benchmarks[m]['total_params'] for m in CONFIG['models'])/1e6:.2f}",
-        'FPS': f"{min(all_benchmarks[m]['fps'] for m in CONFIG['models']):.1f}",
-        'Inference_Time_ms': f"{max(all_benchmarks[m]['inference_time_ms'] for m in CONFIG['models']):.2f}",
-        'Best_Val_Acc': '-',
-        'Test_Accuracy': f"{metrics['accuracy']:.4f}",
-        'Test_Precision': f"{metrics['precision']:.4f}",
-        'Test_Recall': f"{metrics['recall']:.4f}",
-        'Test_F1': f"{metrics['f1']:.4f}",
-    }
-    results_summary.append(result_row)
-
-summary_df = pd.DataFrame(results_summary)
-summary_path = os.path.join(OUTPUT_DIRS["results"], "models_summary.csv")
-summary_df.to_csv(summary_path, index=False)
-
-logging.info("\n" + "="*80)
-logging.info("RESULTS SUMMARY")
-logging.info("="*80)
-print(summary_df.to_string(index=False))
-
-logging.info("\n" + "="*80)
-logging.info("TRAINING COMPLETE")
-logging.info("="*80)
-logging.info(f"Output directory: {PATH_OUTPUT}")
-logging.info(f"Results summary: {summary_path}")
-logging.info("="*80)
+    print(f"\n✓ Training summary saved: {summary_path}")
+    print(f"✓ Output directory: {PATH_OUTPUT}")

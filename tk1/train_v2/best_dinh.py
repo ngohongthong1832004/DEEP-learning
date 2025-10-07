@@ -14,9 +14,6 @@ from ultralytics import YOLO
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
 
-DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/trumanrase/rice_disease_val_test/val"
-CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolov8n_leaf_disease_2025-10-06_01-23-16/best.pt"
-OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected/trumanrase_val"
 
 # CONF_THRESH  = 0.4
 # IOU_THRESH   = 0.5
@@ -51,7 +48,6 @@ def save_image(path: Path, img: np.ndarray):
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), np.ascontiguousarray(img))
 
-# ===================== WORKER =====================
 def process_disease_dir(
     disease_dir: Path, 
     model_path: str, 
@@ -64,23 +60,33 @@ def process_disease_dir(
     use_cuda: bool, 
     device_id: int
 ) -> dict:
-    """Xử lý 1 thư mục bệnh độc lập"""
+    """Xử lý 1 thư mục bệnh độc lập (lưu 3 loại ảnh: gốc, overlay, crop)"""
     from ultralytics import YOLO
     import cv2, torch, gc, json, numpy as np
     from pathlib import Path
 
+    # ====== TẢI MODEL ======
     model = YOLO(model_path)
     model.to(device_id if use_cuda else "cpu")
     names = model.names
 
+    # ====== TẠO THƯ MỤC ĐẦU RA ======
     err_file = Path(output_root) / f"errors_{disease_dir.name}.jsonl"
     imgs = [p for p in disease_dir.iterdir() if p.is_file() and is_image_file(p)]
-    out_dir = Path(output_root) / disease_dir.name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_root = Path(output_root) / disease_dir.name
+    out_dir_root.mkdir(parents=True, exist_ok=True)
+    
+    # Thư mục con:
+    out_original = out_dir_root / "original"
+    out_overlay  = out_dir_root / "overlay"
+    out_crops    = out_dir_root / "crops"
+    for d in [out_original, out_overlay, out_crops]:
+        d.mkdir(parents=True, exist_ok=True)
 
     summary = []
     done = 0
 
+    # ====== DỰ ĐOÁN THEO BATCH ======
     for bi, batch_paths in enumerate(chunk_list(imgs, batch_size), 1):
         try:
             results = model.predict(
@@ -97,27 +103,45 @@ def process_disease_dir(
                 f.write(json.dumps({"stage": "batch_predict", "class": disease_dir.name, "error": str(e)}, ensure_ascii=False) + "\n")
             continue
 
+        # ====== HẬU XỬ LÝ KẾT QUẢ ======
         for p, res in zip(batch_paths, results):
             try:
                 img = cv2.imread(str(p))
                 if img is None:
                     raise ValueError("Unreadable image")
+
                 det = res.boxes
                 boxes = det.data.cpu().numpy() if det is not None and len(det) else np.empty((0, 6), dtype=float)
                 overlay = img.copy()
 
+                # ---------- (1) LƯU ẢNH GỐC ----------
+                cv2.imwrite(str(out_original / f"{p.stem}_original.jpg"), img)
+
+                # ---------- (2) VẼ BOX LÊN ẢNH ----------
                 for *xyxy, conf_, cls in boxes:
                     label = names.get(int(cls), f"id{int(cls)}")
                     x1, y1, x2, y2 = map(int, xyxy)
                     cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(overlay, f"{label} {conf_:.2f}", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                
-                save_image(out_dir / f"{p.stem}_overlay.jpg", overlay)
+                    cv2.putText(overlay, f"{label} {conf_:.2f}", (x1, max(0, y1 - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                    # ---------- (3) LƯU CROP ----------
+                    crop = img[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        crop_name = f"{sanitize_text(p.stem)}_{sanitize_text(label)}_{int(conf_ * 100)}.jpg"
+                        cv2.imwrite(str(out_crops / crop_name), crop)
+
+                # ---------- LƯU ẢNH OVERLAY ----------
+                cv2.imwrite(str(out_overlay / f"{p.stem}_overlay.jpg"), overlay)
 
                 summary.append({
                     "image": str(p),
-                    "detections": len(boxes)
+                    "detections": len(boxes),
+                    "original": str(out_original / f"{p.stem}_original.jpg"),
+                    "overlay": str(out_overlay / f"{p.stem}_overlay.jpg"),
+                    "crops_dir": str(out_crops)
                 })
+
             except Exception as e2:
                 with open(err_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps({
@@ -191,4 +215,48 @@ def main():
 
 # ===================== ENTRY =====================
 if __name__ == "__main__":
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/loki4514/Rice_Leaf_Diease/Rice_Leaf_Diease/test"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolov8n_leaf_disease_2025-10-06_01-23-16/best.pt"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/loki4514_test"
     main()
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/loki4514/Rice_Leaf_Diease/Rice_Leaf_Diease/train"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/loki4514_train"
+    main()
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/paddy_disease_classification/train_images"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/paddy_disease_train"
+    main()
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/sikhaok/Onfield_riceleafpathology/Test"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_test"
+    main()
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/sikhaok/Onfield_riceleafpathology/Train"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_train"
+    main()
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/sikhaok/Onfield_riceleafpathology/Validation"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_val"
+    main()
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/trumanrase/rice_disease_val_test/test"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/trumanrase_test"
+    main()
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/trumanrase/rice_disease_val_test/train"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/trumanrase_train"
+    main()
+    
+    DATA_ROOT    = "/home/bbsw/thong/deep_learning/tk1/data/raw/trumanrase/rice_disease_val_test/val"
+    CKPT_PATH    = "/home/bbsw/thong/deep_learning/tk1/output/yolo/yolov8n_leaf_disease_finetune_2025-10-06_11-35-15/weights/epoch140.pt"
+    OUTPUT_ROOT  = "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/trumanrase_val"
+    main()
+    

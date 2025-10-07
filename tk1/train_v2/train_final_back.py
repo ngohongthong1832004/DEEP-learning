@@ -25,7 +25,6 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms, models
-import cv2
 
 try:
     from torch.amp import GradScaler, autocast
@@ -55,24 +54,24 @@ seed_everything(42)
 CONFIG = {
     # Models to train (all <50M params)
     'models': [
-        # 'mobilenet_v3_small',    # ~2.5M params
-        # 'mobilenet_v3_large',    # ~5.4M params
+        'mobilenet_v3_small',    # ~2.5M params
+        'mobilenet_v3_large',    # ~5.4M params
         'efficientnet_b0',       # ~5.3M params
-        # 'efficientnet_v2_s',     # ~21M params
-        # 'resnet18',              # ~11M params
+        'efficientnet_v2_s',     # ~21M params
+        'resnet18',              # ~11M params
         # 'shufflenet_v2_x1_0',    # ~2.3M params
     ],
     
     # Training
     'img_size': 224,
-    'batch_size': 28,
-    'epochs': 30,
+    'batch_size': 128,
+    'epochs': 50,
     'lr': 2e-4,
     'num_workers': 8,
     'pin_memory': True,
     
     # Model enhancements
-    'use_cbam': True,   
+    'use_cbam': True,
     'use_better_head': True,
     
     # Optimizations
@@ -84,11 +83,6 @@ CONFIG = {
     'ema_decay': 0.999,
     'use_mixup': True,
     'mixup_alpha': 0.1,
-    
-    # CLAHE preprocessing
-    'use_clahe': True,
-    'clahe_clip_limit': 2.0,
-    'clahe_tile_size': (8, 8),
     
     # Early stopping
     'patience': 12,
@@ -110,7 +104,7 @@ def get_output_folder(parent_dir: str, env_name: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
-PATH_OUTPUT = get_output_folder("../output", "thong-result-final-for-change-parameter-1")
+PATH_OUTPUT = get_output_folder("../output", "multi-model-classifier-v2-final")
 
 def create_output_structure(base_path):
     folders = ["weights", "results", "plots", "logs", "demo", "comparison"]
@@ -144,35 +138,28 @@ logger = setup_logging(PATH_OUTPUT)
 # ===== LABELS =====
 LABELS = {
     0: {"name": "brown_spot", "match_substrings": [
-        # "../data_total/brown_spot",
-        # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/brown_spot/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/BrownSpot/crops",
-        # "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
+        "../data_total/brown_spot",
+        "../data/yolo_detected_epoch_40/paddy_disease_train/brown_spot/crops",
+        "../data/yolo_detected_epoch_40/sikhaok_train/BrownSpot/crops",
     ]},
     1: {"name": "leaf_blast", "match_substrings": [
-        # "../data_total/blast",
-        # "../data/yolo_detected_epoch_140/loki4514_train/leaf_blast/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/blast/crops",
-        # "../data/yolo_detected_epoch_140/sikhaok_train/LeafBlast/crops",
-        # "../data/yolo_detected_epoch_140/trumanrase_train/blast/crops",
+        "../data_total/blast",
+        "../data/yolo_detected_epoch_40/paddy_disease_train/blast/crops",
+        "../data/yolo_detected_epoch_40/sikhaok_train/LeafBlast/crops",
     ]},
     2: {"name": "leaf_blight", "match_substrings": [
-        # "../data_total/bacterial_leaf_blight",
-        # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/Bacterialblight1/crops",
-        "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
+        "../data_total/bacterial_leaf_blight",
+        "../data/yolo_detected_epoch_40/paddy_disease_train/bacterial_leaf_blight/crops",
+        "../data/yolo_detected_epoch_40/sikhaok_train/Bacterialblight1/crops",
+        "../data/yolo_detected_epoch_40/trumanrase_train/bacterial_leaf_blight/crops",
     ]},
     3: {"name": "healthy", "match_substrings": [
         "../data_total/normal",
-        # "../data/yolo_detected_epoch_140/loki4514_train/healthy/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/normal/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/Healthy/crops",
-        # "../data/raw/paddy_disease_classification/train_images/normal",
+        "../data/yolo_detected_epoch_40/paddy_disease_train/normal/crops",
+        "../data/yolo_detected_epoch_40/sikhaok_train/Healthy/crops",
+        "../data/raw/paddy_disease_classification/train_images/normal",
     ]},
 }
-
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -891,24 +878,6 @@ class SymmetricCrossEntropy(nn.Module):
         rce = (-torch.sum(onehot * torch.log(pred), dim=1)).mean()
         return self.alpha * ce + self.beta * rce
 
-# class SymmetricCrossEntropy(nn.Module):
-#     def __init__(self, alpha=0.1, beta=1.0, num_classes=4, eps=0.1):
-#         super().__init__()
-#         self.alpha, self.beta, self.num_classes, self.eps = alpha, beta, num_classes, eps
-
-#     def forward(self, logits, targets):
-#         ce = F.cross_entropy(logits, targets)
-#         # KHÔNG dùng clamp_ (in-place)
-#         pred = F.softmax(logits, dim=1)
-#         pred = pred.clamp(1e-7, 1 - 1e-7)          # out-of-place
-
-#         y = F.one_hot(targets, self.num_classes).float()
-#         y = y * (1 - self.eps) + (1 - y) * (self.eps / (self.num_classes - 1))
-#         rce = (-pred * torch.log(y)).sum(dim=1).mean()
-#         return self.alpha * ce + self.beta * rce
-
-
-
 # ===== MIXUP =====
 def mixup_data(x, y, alpha=0.2):
     """Apply mixup augmentation"""
@@ -945,48 +914,6 @@ class ModelEMA:
             else:
                 v.copy_(msd[k])
 
-# ===== CLAHE TRANSFORM =====
-class CLAHETransform:
-    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to PIL Images"""
-    
-    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8)):
-        """
-        Args:
-            clip_limit: Threshold for contrast limiting (higher = more contrast)
-            tile_grid_size: Size of grid for histogram equalization (e.g., (8,8))
-        """
-        self.clip_limit = clip_limit
-        self.tile_grid_size = tile_grid_size
-        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    
-    def __call__(self, pil_image):
-        """
-        Apply CLAHE to PIL Image
-        
-        Args:
-            pil_image: PIL Image in RGB format
-            
-        Returns:
-            PIL Image with CLAHE applied
-        """
-        # Convert PIL to numpy array
-        img_array = np.array(pil_image)
-        
-        # Convert RGB to LAB color space (better for CLAHE)
-        lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
-        
-        # Apply CLAHE to L channel (luminance)
-        lab[:, :, 0] = self.clahe.apply(lab[:, :, 0])
-        
-        # Convert back to RGB
-        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-        
-        # Convert back to PIL Image
-        return Image.fromarray(enhanced.astype(np.uint8))
-    
-    def __repr__(self):
-        return f"CLAHETransform(clip_limit={self.clip_limit}, tile_grid_size={self.tile_grid_size})"
-
 # ===== DATASET =====
 class ImageDataset(Dataset):
     def __init__(self, df, transform=None):
@@ -1006,24 +933,7 @@ class ImageDataset(Dataset):
 
 # ===== TRANSFORMS =====
 def get_transforms(size):
-    """Get training and validation transforms with optional CLAHE preprocessing"""
-    
-    # Base transform components
-    base_train_transforms = []
-    base_val_transforms = []
-    
-    # Add CLAHE if enabled
-    if CONFIG['use_clahe']:
-        clahe_transform = CLAHETransform(
-            clip_limit=CONFIG['clahe_clip_limit'],
-            tile_grid_size=CONFIG['clahe_tile_size']
-        )
-        base_train_transforms.append(clahe_transform)
-        base_val_transforms.append(clahe_transform)
-        logging.info(f"CLAHE enabled: clip_limit={CONFIG['clahe_clip_limit']}, tile_size={CONFIG['clahe_tile_size']}")
-    
-    # Training transforms
-    train_transforms = base_train_transforms + [
+    train_transform = transforms.Compose([
         transforms.RandomResizedCrop(size, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
@@ -1031,17 +941,13 @@ def get_transforms(size):
         transforms.TrivialAugmentWide(num_magnitude_bins=31),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
+    ])
     
-    # Validation transforms
-    val_transforms = base_val_transforms + [
+    val_transform = transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-    
-    train_transform = transforms.Compose(train_transforms)
-    val_transform = transforms.Compose(val_transforms)
+    ])
     
     return train_transform, val_transform
 
@@ -1105,11 +1011,6 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
     else:
         criterion = nn.CrossEntropyLoss()
     
-    # Prepare loaders first (needed for steps_per_epoch)
-    train_transform, val_transform = get_transforms(CONFIG['img_size'])
-    train_loader = make_loader(train_df, train_transform, CONFIG['batch_size'], train=True)
-    val_loader = make_loader(val_df, val_transform, CONFIG['batch_size'], train=False)
-    
     # Optimizer & Scheduler
     optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-4)
     steps_per_epoch = len(train_loader)
@@ -1125,6 +1026,11 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
     
     # EMA
     ema = ModelEMA(model, decay=CONFIG['ema_decay']) if CONFIG['use_ema'] else None
+    
+    # Prepare loaders
+    train_transform, val_transform = get_transforms(CONFIG['img_size'])
+    train_loader = make_loader(train_df, train_transform, CONFIG['batch_size'], train=True)
+    val_loader = make_loader(val_df, val_transform, CONFIG['batch_size'], train=False)
     
     best_val_acc = 0.0
     bad_epochs = 0
@@ -1158,7 +1064,6 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             
             if ema is not None:
                 ema.update(model)
@@ -1198,6 +1103,8 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
+        
+        scheduler.step()
         
         logging.info(f"[{model_name}] Epoch {epoch}: TL={train_loss:.4f} TA={train_acc:.4f} | VL={val_loss:.4f} VA={val_acc:.4f}")
         
@@ -1424,68 +1331,58 @@ if CONFIG['use_ensemble'] and len(CONFIG['models']) > 1:
 # ## VISUALIZATION & COMPARISON
 
 # %%
-def _ema_smooth(arr, alpha=0.2):
-    if len(arr) == 0: return np.array([])
-    sm = [arr[0]]
-    for x in arr[1:]:
-        sm.append(alpha * x + (1 - alpha) * sm[-1])
-    return np.array(sm)
-
-def plot_training_curves(all_histories, ema_alpha=0.25):
+def plot_training_curves(all_histories):
+    """Plot training curves for all models"""
+    
     n_models = len(all_histories)
-    cols = min(3, max(1, n_models))
-    rows = int(np.ceil(n_models / cols))
-
-    plt.style.use('seaborn-v0_8-whitegrid')  # style dịu mắt
-    fig, axes = plt.subplots(rows, cols, figsize=(6.5*cols, 4.8*rows))
-    axes = np.array(axes, dtype=object).ravel() if isinstance(axes, np.ndarray) else np.array([axes])
-
+    cols = 3
+    rows = (n_models + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
+    if n_models == 1:
+        axes = [axes]
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    
     for idx, (model_name, history) in enumerate(all_histories.items()):
-        ax = axes[idx]
-        ep = np.arange(1, len(history['train_loss']) + 1)
-
-        # smoothing
-        tr_acc = _ema_smooth(history['train_acc'], ema_alpha)
-        va_acc = _ema_smooth(history['val_acc'],   ema_alpha)
-        tr_loss = _ema_smooth(history['train_loss'], ema_alpha)
-        va_loss = _ema_smooth(history['val_loss'],   ema_alpha)
-
-        # ACC
-        l1, = ax.plot(ep, tr_acc, linewidth=2.2, label='Train Acc')
-        l2, = ax.plot(ep, va_acc, linewidth=2.2, label='Val Acc')
-
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Accuracy')
-        ax.set_ylim(0, 1)
-        ax.set_title(f'{model_name} — Accuracy (EMA α={ema_alpha})', pad=8, fontsize=11)
-        ax.grid(True, alpha=0.25)
-
-        # LOSS (trục phụ)
-        ax2 = ax.twinx()
-        ax2.plot(ep, tr_loss, '--', linewidth=1.6, label='Train Loss', alpha=0.9)
-        ax2.plot(ep, va_loss,  '--', linewidth=1.6, label='Val Loss',   alpha=0.9)
-        # fill nhẹ dưới đường loss validation cho “mịn”
-        ax2.fill_between(ep, va_loss, np.minimum.accumulate(va_loss), alpha=0.08)
-
-        ax2.set_ylabel('Loss')
-
-        # gộp legend 2 trục
-        lines = [l1, l2]
-        lines += ax2.get_lines()[0:2]
-        labels = [ln.get_label() for ln in lines]
-        ax.legend(lines, labels, loc='lower right', frameon=True, fontsize=9)
-
-    # ẩn ô trống
-    for j in range(n_models, len(axes)):
-        axes[j].axis('off')
-
-    plt.suptitle('Training Curves (Smoothed)', fontsize=16, fontweight='bold', y=1.02)
+        row, col = idx // cols, idx % cols
+        ax_acc = axes[row, col] if rows > 1 else axes[col]
+        
+        epochs = range(1, len(history['train_loss']) + 1)
+        
+        # Plot accuracy
+        ax_acc.plot(epochs, history['train_acc'], 'b-', label='Train Acc', linewidth=2)
+        ax_acc.plot(epochs, history['val_acc'], 'r-', label='Val Acc', linewidth=2)
+        ax_acc.set_xlabel('Epoch')
+        ax_acc.set_ylabel('Accuracy')
+        ax_acc.set_title(f'{model_name} - Accuracy', fontweight='bold')
+        ax_acc.legend()
+        ax_acc.grid(True, alpha=0.3)
+        ax_acc.set_ylim(0, 1)
+        
+        # Add loss on secondary axis
+        ax_loss = ax_acc.twinx()
+        ax_loss.plot(epochs, history['train_loss'], 'g--', label='Train Loss', alpha=0.7)
+        ax_loss.plot(epochs, history['val_loss'], 'm--', label='Val Loss', alpha=0.7)
+        ax_loss.set_ylabel('Loss')
+        ax_loss.legend(loc='upper right')
+    
+    # Hide empty subplots
+    for idx in range(n_models, rows * cols):
+        if rows > 1:
+            row, col = idx // cols, idx % cols
+            axes[row, col].axis('off')
+        elif cols > 1 and idx < len(axes):
+            axes[idx].axis('off')
+    
+    plt.suptitle('Training Curves - All Models', fontsize=16, fontweight='bold')
     plt.tight_layout()
+    
     save_path = os.path.join(OUTPUT_DIRS["plots"], "training_curves.png")
-    plt.savefig(save_path, dpi=220, bbox_inches='tight')
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.show()
+    
     logging.info(f"✓ Training curves saved: {save_path}")
-
 
 def plot_model_comparison(all_test_metrics, all_histories):
     """Plot comprehensive comparison of all models"""
@@ -1903,72 +1800,6 @@ def plot_advanced_metrics_visualization(all_test_metrics, all_histories, all_ben
     return advanced_viz_path
 
 # %%
-def create_clahe_demo(test_df, num_samples=8):
-    """Create CLAHE comparison demo"""
-    
-    logging.info("\n" + "="*60)
-    logging.info("CREATING CLAHE DEMONSTRATION")
-    logging.info("="*60)
-    
-    # Sample images from each class
-    class_names = [LABELS[i]['name'] for i in sorted(LABELS.keys())]
-    demo_samples = []
-    
-    for class_id in range(len(class_names)):
-        class_data = test_df[test_df['label_id'] == class_id]
-        if len(class_data) > 0:
-            samples = class_data.sample(min(2, len(class_data)), random_state=42)
-            demo_samples.extend(samples.to_dict('records'))
-    
-    # Limit total samples
-    if len(demo_samples) > num_samples:
-        demo_samples = demo_samples[:num_samples]
-    
-    # Create CLAHE transform
-    clahe_transform = CLAHETransform(
-        clip_limit=CONFIG['clahe_clip_limit'],
-        tile_grid_size=CONFIG['clahe_tile_size']
-    )
-    
-    # Create comparison figure
-    cols = 2  # Original, CLAHE
-    rows = len(demo_samples)
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows))
-    
-    if rows == 1:
-        axes = axes.reshape(1, -1)
-    
-    for idx, sample in enumerate(demo_samples):
-        # Load image
-        img_path = sample['image_path']
-        original_img = Image.open(img_path).convert('RGB')
-        
-        # Apply CLAHE
-        clahe_img = clahe_transform(original_img)
-        
-        # Display original
-        axes[idx, 0].imshow(original_img)
-        axes[idx, 0].set_title(f'Original - {sample["label_name"]}', fontweight='bold')
-        axes[idx, 0].axis('off')
-        
-        # Display CLAHE enhanced
-        axes[idx, 1].imshow(clahe_img)
-        axes[idx, 1].set_title(f'CLAHE Enhanced - {sample["label_name"]}', fontweight='bold')
-        axes[idx, 1].axis('off')
-    
-    plt.suptitle(f'CLAHE Comparison (clip_limit={CONFIG["clahe_clip_limit"]}, tile_size={CONFIG["clahe_tile_size"]})', 
-                 fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    
-    # Save demo
-    demo_path = os.path.join(OUTPUT_DIRS["demo"], "clahe_comparison.png")
-    plt.savefig(demo_path, dpi=200, bbox_inches='tight')
-    plt.show()
-    
-    logging.info(f"✓ CLAHE demo saved: {demo_path}")
-    
-    return demo_path
-
 def create_demo_predictions(all_checkpoints, test_df, num_samples=16):
     """Create demo predictions with sample images"""
     
@@ -2083,10 +1914,6 @@ def create_demo_predictions(all_checkpoints, test_df, num_samples=16):
     gc.collect()
     
     return demo_results
-
-# Create CLAHE demonstration
-if CONFIG['use_clahe']:
-    clahe_demo_path = create_clahe_demo(test_df)
 
 # Create demo predictions
 demo_results = create_demo_predictions(all_checkpoints, test_df)
@@ -2288,4 +2115,5 @@ logging.info(f"Simple summary: {simple_path}")
 logging.info(f"Comprehensive results: {summary_path}")
 logging.info(f"Training curves: {os.path.join(OUTPUT_DIRS['plots'], 'training_curves.png')}")
 logging.info(f"Demo predictions: {os.path.join(OUTPUT_DIRS['demo'], 'predictions_demo.png')}")
+logging.info(f"Performance chart: {perf_chart_path}")
 logging.info("="*80)

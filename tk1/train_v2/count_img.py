@@ -79,26 +79,32 @@ def count_dataset(LABELS: dict, recursive: bool = True, save_csv: str = None):
 if __name__ == "__main__":
     LABELS = {
         0: {"name": "brown_spot", "match_substrings": [
-            "../data_total/brown_spot",
-            "../data/yolo_detected_epoch_40/paddy_disease_train/brown_spot/crops",
-            "../data/yolo_detected_epoch_40/sikhaok_train/BrownSpot/crops",
+            # "../data_total/brown_spot",
+            # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
+            "../data/yolo_detected_epoch_140/paddy_disease_train/brown_spot/crops",
+            "../data/yolo_detected_epoch_140/sikhaok_train/BrownSpot/crops",
+            # "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
         ]},
         1: {"name": "leaf_blast", "match_substrings": [
-            "../data_total/blast",
-            "../data/yolo_detected_epoch_40/paddy_disease_train/blast/crops",
-            "../data/yolo_detected_epoch_40/sikhaok_train/LeafBlast/crops",
+            # "../data_total/blast",
+            # "../data/yolo_detected_epoch_140/loki4514_train/leaf_blast/crops",
+            "../data/yolo_detected_epoch_140/paddy_disease_train/blast/crops",
+            # "../data/yolo_detected_epoch_140/sikhaok_train/LeafBlast/crops",
+            # "../data/yolo_detected_epoch_140/trumanrase_train/blast/crops",
         ]},
         2: {"name": "leaf_blight", "match_substrings": [
-            "../data_total/bacterial_leaf_blight",
-            "../data/yolo_detected_epoch_40/paddy_disease_train/bacterial_leaf_blight/crops",
-            "../data/yolo_detected_epoch_40/sikhaok_train/Bacterialblight1/crops",
-            "../data/yolo_detected_epoch_40/trumanrase_train/bacterial_leaf_blight/crops",
+            # "../data_total/bacterial_leaf_blight",
+            # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
+            "../data/yolo_detected_epoch_140/paddy_disease_train/bacterial_leaf_blight/crops",
+            "../data/yolo_detected_epoch_140/sikhaok_train/Bacterialblight1/crops",
+            "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
         ]},
         3: {"name": "healthy", "match_substrings": [
             "../data_total/normal",
-            "../data/yolo_detected_epoch_40/paddy_disease_train/normal/crops",
-            "../data/yolo_detected_epoch_40/sikhaok_train/Healthy/crops",
-            "../data/raw/paddy_disease_classification/train_images/normal",
+            # "../data/yolo_detected_epoch_140/loki4514_train/healthy/crops",
+            "../data/yolo_detected_epoch_140/paddy_disease_train/normal/crops",
+            "../data/yolo_detected_epoch_140/sikhaok_train/Healthy/crops",
+            # "../data/raw/paddy_disease_classification/train_images/normal",
         ]},
     }
 

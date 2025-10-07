@@ -1,9 +1,4 @@
-# %% [markdown]
-# # Multi-Model Rice Disease Classification
-# Train and compare 6 lightweight models (<50M params) optimized for rice leaf disease classification
-
-# %%
-# ===== IMPORTS =====
+import os
 import os, shutil, random, torch, gc, time, sys
 import pandas as pd
 import numpy as np
@@ -50,8 +45,6 @@ def seed_everything(seed=42):
 
 seed_everything(42)
 
-# %%
-# ===== CONFIGURATION =====
 CONFIG = {
     # Models to train (all <50M params)
     'models': [
@@ -65,14 +58,14 @@ CONFIG = {
     
     # Training
     'img_size': 224,
-    'batch_size': 28,
-    'epochs': 30,
-    'lr': 2e-4,
+    'batch_size': 32,
+    'epochs': 40,
+    'lr': 1e-3,
     'num_workers': 8,
     'pin_memory': True,
     
     # Model enhancements
-    'use_cbam': True,   
+    'use_cbam': True,
     'use_better_head': True,
     
     # Optimizations
@@ -110,7 +103,7 @@ def get_output_folder(parent_dir: str, env_name: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
-PATH_OUTPUT = get_output_folder("../output", "thong-result-final-for-change-parameter-1")
+PATH_OUTPUT = get_output_folder("../output", "thong-real-result-final")
 
 def create_output_structure(base_path):
     folders = ["weights", "results", "plots", "logs", "demo", "comparison"]
@@ -145,45 +138,48 @@ logger = setup_logging(PATH_OUTPUT)
 LABELS = {
     0: {"name": "brown_spot", "match_substrings": [
         # "../data_total/brown_spot",
-        # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/brown_spot/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/BrownSpot/crops",
-        # "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/paddy_disease_train/brown_spot/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_train/BrownSpot/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
     ]},
     1: {"name": "leaf_blast", "match_substrings": [
         # "../data_total/blast",
-        # "../data/yolo_detected_epoch_140/loki4514_train/leaf_blast/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/blast/crops",
-        # "../data/yolo_detected_epoch_140/sikhaok_train/LeafBlast/crops",
-        # "../data/yolo_detected_epoch_140/trumanrase_train/blast/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/loki4514_train/leaf_blast/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/paddy_disease_train/blast/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_train/LeafBlast/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/trumanrase_train/blast/crops",
     ]},
     2: {"name": "leaf_blight", "match_substrings": [
         # "../data_total/bacterial_leaf_blight",
-        # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/Bacterialblight1/crops",
-        "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/paddy_disease_train/bacterial_leaf_blight/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_train/Bacterialblight1/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
     ]},
     3: {"name": "healthy", "match_substrings": [
         "../data_total/normal",
-        # "../data/yolo_detected_epoch_140/loki4514_train/healthy/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/normal/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/Healthy/crops",
+        # "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/loki4514_train/healthy/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/paddy_disease_train/normal/crops",
+        "/home/bbsw/thong/deep_learning/tk1/data/yolo_detected_epoch_140/sikhaok_train/Healthy/crops",
         # "../data/raw/paddy_disease_classification/train_images/normal",
     ]},
 }
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+warnings.filterwarnings('ignore')
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.info(f"Device: {DEVICE}")
+# ===== DEVICE CONFIG =====
 if torch.cuda.is_available():
-    logging.info(f"GPU: {torch.cuda.get_device_name(0)}")
+    DEVICE = torch.device("cuda:0")  # cuda:0 ở đây thực chất là GPU1 do đã ẩn GPU0
+    logging.info(f"GPU count visible to torch: {torch.cuda.device_count()}")
+    logging.info(f"Using device: {DEVICE}")
+    logging.info(f"GPU name: {torch.cuda.get_device_name(0)}")
+else:
+    DEVICE = torch.device("cpu")
+    logging.info("Using CPU")
 
-# %% [markdown]
-# ## MODEL COMPONENTS
-
-# %%
 # ===== CBAM ATTENTION =====
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
@@ -698,11 +694,8 @@ def create_individual_charts(df, output_dir, class_counts):
     logging.info(f"  - {chart_path}")
     logging.info(f"  - {source_chart_path}")
 
-# Create data visualizations
 visualize_dataset_distribution(collected_df, OUTPUT_DIRS["plots"])
 
-# %%
-# Split data
 train_val_df, test_df = train_test_split(
     collected_df, test_size=CONFIG['test_size'], random_state=42, stratify=collected_df['label_id']
 )
@@ -891,24 +884,6 @@ class SymmetricCrossEntropy(nn.Module):
         rce = (-torch.sum(onehot * torch.log(pred), dim=1)).mean()
         return self.alpha * ce + self.beta * rce
 
-# class SymmetricCrossEntropy(nn.Module):
-#     def __init__(self, alpha=0.1, beta=1.0, num_classes=4, eps=0.1):
-#         super().__init__()
-#         self.alpha, self.beta, self.num_classes, self.eps = alpha, beta, num_classes, eps
-
-#     def forward(self, logits, targets):
-#         ce = F.cross_entropy(logits, targets)
-#         # KHÔNG dùng clamp_ (in-place)
-#         pred = F.softmax(logits, dim=1)
-#         pred = pred.clamp(1e-7, 1 - 1e-7)          # out-of-place
-
-#         y = F.one_hot(targets, self.num_classes).float()
-#         y = y * (1 - self.eps) + (1 - y) * (self.eps / (self.num_classes - 1))
-#         rce = (-pred * torch.log(y)).sum(dim=1).mean()
-#         return self.alpha * ce + self.beta * rce
-
-
-
 # ===== MIXUP =====
 def mixup_data(x, y, alpha=0.2):
     """Apply mixup augmentation"""
@@ -1005,14 +980,43 @@ class ImageDataset(Dataset):
         return img, label
 
 # ===== TRANSFORMS =====
+# def get_transforms(size):
+#     """Get training and validation transforms with optional CLAHE preprocessing"""
+#     base_train_transforms = []
+#     base_val_transforms = []
+#     if CONFIG['use_clahe']:
+#         clahe_transform = CLAHETransform(
+#             clip_limit=CONFIG['clahe_clip_limit'],
+#             tile_grid_size=CONFIG['clahe_tile_size']
+#         )
+#         base_train_transforms.append(clahe_transform)
+#         base_val_transforms.append(clahe_transform)
+#         logging.info(f"CLAHE enabled: clip_limit={CONFIG['clahe_clip_limit']}, tile_size={CONFIG['clahe_tile_size']}")
+    
+#     # Training transforms
+#     train_transforms = base_train_transforms + [
+#         transforms.RandomResizedCrop(size, scale=(0.7, 1.0)),
+#         transforms.RandomHorizontalFlip(),
+#         transforms.RandomRotation(15),
+#         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+#         transforms.TrivialAugmentWide(num_magnitude_bins=31),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+#     ]
+    
+#     # Validation transforms
+#     val_transforms = base_val_transforms + [
+#         transforms.Resize((size, size)),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+#     ]
+    
+#     train_transform = transforms.Compose(train_transforms)
+#     val_transform = transforms.Compose(val_transforms)
+    
+#     return train_transform, val_transform
 def get_transforms(size):
-    """Get training and validation transforms with optional CLAHE preprocessing"""
-    
-    # Base transform components
-    base_train_transforms = []
-    base_val_transforms = []
-    
-    # Add CLAHE if enabled
+    base_train_transforms, base_val_transforms = [], []
     if CONFIG['use_clahe']:
         clahe_transform = CLAHETransform(
             clip_limit=CONFIG['clahe_clip_limit'],
@@ -1021,29 +1025,29 @@ def get_transforms(size):
         base_train_transforms.append(clahe_transform)
         base_val_transforms.append(clahe_transform)
         logging.info(f"CLAHE enabled: clip_limit={CONFIG['clahe_clip_limit']}, tile_size={CONFIG['clahe_tile_size']}")
-    
-    # Training transforms
+
+    resize_size = 256  # <— tăng input trước khi crop
     train_transforms = base_train_transforms + [
-        transforms.RandomResizedCrop(size, scale=(0.7, 1.0)),
+        transforms.Resize((resize_size, resize_size)),
+        transforms.RandomResizedCrop(size, scale=(0.6, 1.0)),   # rộng hơn
         transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(p=0.2),
         transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomPerspective(distortion_scale=0.25, p=0.2),
+        transforms.ColorJitter(brightness=0.2, contrast=0.25, saturation=0.2, hue=0.02),
         transforms.TrivialAugmentWide(num_magnitude_bins=31),
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.25),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]
-    
-    # Validation transforms
+
     val_transforms = base_val_transforms + [
-        transforms.Resize((size, size)),
+        transforms.Resize((resize_size, resize_size)),
+        transforms.CenterCrop(size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]
-    
-    train_transform = transforms.Compose(train_transforms)
-    val_transform = transforms.Compose(val_transforms)
-    
-    return train_transform, val_transform
+    return transforms.Compose(train_transforms), transforms.Compose(val_transforms)
 
 # ===== DATA LOADERS =====
 def make_loader(df, transform, batch_size, train=True):
@@ -1198,6 +1202,8 @@ def train_single_model(model_name: str, train_df, val_df, epochs):
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
+        
+        # scheduler.step()
         
         logging.info(f"[{model_name}] Epoch {epoch}: TL={train_loss:.4f} TA={train_acc:.4f} | VL={val_loss:.4f} VA={val_acc:.4f}")
         
@@ -1424,68 +1430,45 @@ if CONFIG['use_ensemble'] and len(CONFIG['models']) > 1:
 # ## VISUALIZATION & COMPARISON
 
 # %%
-def _ema_smooth(arr, alpha=0.2):
-    if len(arr) == 0: return np.array([])
-    sm = [arr[0]]
-    for x in arr[1:]:
-        sm.append(alpha * x + (1 - alpha) * sm[-1])
-    return np.array(sm)
-
-def plot_training_curves(all_histories, ema_alpha=0.25):
+def plot_training_curves(all_histories):
+    """Plot training curves for all models"""
     n_models = len(all_histories)
     cols = min(3, max(1, n_models))
     rows = int(np.ceil(n_models / cols))
 
-    plt.style.use('seaborn-v0_8-whitegrid')  # style dịu mắt
-    fig, axes = plt.subplots(rows, cols, figsize=(6.5*cols, 4.8*rows))
-    axes = np.array(axes, dtype=object).ravel() if isinstance(axes, np.ndarray) else np.array([axes])
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows))
+    # đảm bảo axes là 1D array các Axes
+    axes = np.array(axes, dtype=object).ravel()
 
+    # Vẽ từng model
     for idx, (model_name, history) in enumerate(all_histories.items()):
         ax = axes[idx]
-        ep = np.arange(1, len(history['train_loss']) + 1)
+        epochs = range(1, len(history['train_loss']) + 1)
 
-        # smoothing
-        tr_acc = _ema_smooth(history['train_acc'], ema_alpha)
-        va_acc = _ema_smooth(history['val_acc'],   ema_alpha)
-        tr_loss = _ema_smooth(history['train_loss'], ema_alpha)
-        va_loss = _ema_smooth(history['val_loss'],   ema_alpha)
+        # Accuracy
+        ax.plot(epochs, history['train_acc'], label='Train Acc', linewidth=2)
+        ax.plot(epochs, history['val_acc'],   label='Val Acc',   linewidth=2)
+        ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy'); ax.set_ylim(0, 1)
+        ax.set_title(f'{model_name} - Accuracy')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
 
-        # ACC
-        l1, = ax.plot(ep, tr_acc, linewidth=2.2, label='Train Acc')
-        l2, = ax.plot(ep, va_acc, linewidth=2.2, label='Val Acc')
-
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Accuracy')
-        ax.set_ylim(0, 1)
-        ax.set_title(f'{model_name} — Accuracy (EMA α={ema_alpha})', pad=8, fontsize=11)
-        ax.grid(True, alpha=0.25)
-
-        # LOSS (trục phụ)
+        # Loss (trục phụ)
         ax2 = ax.twinx()
-        ax2.plot(ep, tr_loss, '--', linewidth=1.6, label='Train Loss', alpha=0.9)
-        ax2.plot(ep, va_loss,  '--', linewidth=1.6, label='Val Loss',   alpha=0.9)
-        # fill nhẹ dưới đường loss validation cho “mịn”
-        ax2.fill_between(ep, va_loss, np.minimum.accumulate(va_loss), alpha=0.08)
-
+        ax2.plot(epochs, history['train_loss'], '--', label='Train Loss', alpha=0.7)
+        ax2.plot(epochs, history['val_loss'],   '--', label='Val Loss',   alpha=0.7)
         ax2.set_ylabel('Loss')
 
-        # gộp legend 2 trục
-        lines = [l1, l2]
-        lines += ax2.get_lines()[0:2]
-        labels = [ln.get_label() for ln in lines]
-        ax.legend(lines, labels, loc='lower right', frameon=True, fontsize=9)
-
-    # ẩn ô trống
+    # Ẩn axes dư
     for j in range(n_models, len(axes)):
         axes[j].axis('off')
 
-    plt.suptitle('Training Curves (Smoothed)', fontsize=16, fontweight='bold', y=1.02)
+    plt.suptitle('Training Curves - All Models', fontsize=16, fontweight='bold')
     plt.tight_layout()
     save_path = os.path.join(OUTPUT_DIRS["plots"], "training_curves.png")
-    plt.savefig(save_path, dpi=220, bbox_inches='tight')
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.show()
     logging.info(f"✓ Training curves saved: {save_path}")
-
 
 def plot_model_comparison(all_test_metrics, all_histories):
     """Plot comprehensive comparison of all models"""
@@ -1831,7 +1814,6 @@ def plot_advanced_metrics_visualization(all_test_metrics, all_histories, all_ben
     
     # Sort by accuracy
     ranking_data.sort(key=lambda x: float(x[1]), reverse=True)
-    
     # Re-number rankings
     for i, row in enumerate(ranking_data):
         row[0] = f"{i+1}. {row[0].split('. ', 1)[1]}"
