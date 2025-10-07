@@ -53,19 +53,17 @@ seed_everything(42)
 # %%
 # ===== CONFIGURATION =====
 CONFIG = {
+    # Data paths - sửa đường dẫn này theo cấu trúc của bạn
+    'data_root': '/home/bbsw/thong/deep_learning/tk1/data/raw/dataset_0806-20250710T125212Z-1-001/dataset_0806',  # thư mục chứa train/test/valid
+    
     # Models to train (all <50M params)
     'models': [
-        # 'mobilenet_v3_small',    # ~2.5M params
-        # 'mobilenet_v3_large',    # ~5.4M params
-        'efficientnet_b0',       # ~5.3M params
-        # 'efficientnet_v2_s',     # ~21M params
-        # 'resnet18',              # ~11M params
-        # 'shufflenet_v2_x1_0',    # ~2.3M params
+        'mobilenet_v3_small',    # ~2.5M params
     ],
     
     # Training
     'img_size': 224,
-    'batch_size': 28,
+    'batch_size': 32,
     'epochs': 30,
     'lr': 2e-4,
     'num_workers': 8,
@@ -86,16 +84,12 @@ CONFIG = {
     'mixup_alpha': 0.1,
     
     # CLAHE preprocessing
-    'use_clahe': True,
+    'use_clahe': False,
     'clahe_clip_limit': 2.0,
     'clahe_tile_size': (8, 8),
     
     # Early stopping
     'patience': 12,
-    
-    # Data splits
-    'val_size': 0.15,
-    'test_size': 0.15,
     
     # Ensemble
     'use_ensemble': True,
@@ -110,7 +104,7 @@ def get_output_folder(parent_dir: str, env_name: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
-PATH_OUTPUT = get_output_folder("../output", "thong-result-final-for-change-parameter-1")
+PATH_OUTPUT = get_output_folder("../output", "THONG-RESULT-FINAL-GK_V1")
 
 def create_output_structure(base_path):
     folders = ["weights", "results", "plots", "logs", "demo", "comparison"]
@@ -140,37 +134,16 @@ def setup_logging(output_path):
 
 logger = setup_logging(PATH_OUTPUT)
 
+
+
+
 # %%
 # ===== LABELS =====
 LABELS = {
-    0: {"name": "brown_spot", "match_substrings": [
-        # "../data_total/brown_spot",
-        # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/brown_spot/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/BrownSpot/crops",
-        # "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
-    ]},
-    1: {"name": "leaf_blast", "match_substrings": [
-        # "../data_total/blast",
-        # "../data/yolo_detected_epoch_140/loki4514_train/leaf_blast/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/blast/crops",
-        # "../data/yolo_detected_epoch_140/sikhaok_train/LeafBlast/crops",
-        # "../data/yolo_detected_epoch_140/trumanrase_train/blast/crops",
-    ]},
-    2: {"name": "leaf_blight", "match_substrings": [
-        # "../data_total/bacterial_leaf_blight",
-        # "../data/yolo_detected_epoch_140/loki4514_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/bacterial_leaf_blight/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/Bacterialblight1/crops",
-        "../data/yolo_detected_epoch_140/trumanrase_train/bacterial_leaf_blight/crops",
-    ]},
-    3: {"name": "healthy", "match_substrings": [
-        "../data_total/normal",
-        # "../data/yolo_detected_epoch_140/loki4514_train/healthy/crops",
-        "../data/yolo_detected_epoch_140/paddy_disease_train/normal/crops",
-        "../data/yolo_detected_epoch_140/sikhaok_train/Healthy/crops",
-        # "../data/raw/paddy_disease_classification/train_images/normal",
-    ]},
+    0: {"name": "Brown_Spot"},
+    1: {"name": "Leaf_Blast"}, 
+    2: {"name": "Leaf_Blight"},
+    3: {"name": "Normal"},
 }
 
 
@@ -341,377 +314,613 @@ def build_classifier(backbone_name: str, num_classes: int):
 # ## DATA COLLECTION
 
 # %%
-def collect_images_from_path(path: str) -> List[str]:
-    if not os.path.exists(path):
-        return []
-    image_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
-    images = []
-    try:
-        for file in os.listdir(path):
-            if file.endswith(image_extensions):
-                images.append(os.path.join(path, file))
-    except Exception as e:
-        logging.warning(f"Error reading {path}: {e}")
-    return images
-
-def auto_collect_dataset():
+def collect_dataset_from_folders():
+    """Collect dataset from train/test/valid folder structure"""
+    
     logging.info("="*60)
-    logging.info("DATA COLLECTION")
+    logging.info("DATA COLLECTION FROM FOLDERS")
     logging.info("="*60)
     
-    all_data = []
+    data_root = CONFIG['data_root']
+    
+    # Check if data root exists
+    if not os.path.exists(data_root):
+        raise ValueError(f"Data root directory not found: {data_root}")
+    
+    # Expected splits
+    splits = ['train', 'test', 'valid']
+    all_data = {'train': [], 'test': [], 'valid': []}
+    
+    # Get all possible class names from folders
+    available_classes = set()
+    for split in splits:
+        split_path = os.path.join(data_root, split)
+        if os.path.exists(split_path):
+            for item in os.listdir(split_path):
+                item_path = os.path.join(split_path, item)
+                if os.path.isdir(item_path):
+                    available_classes.add(item.lower())
+    
+    logging.info(f"Available classes found: {sorted(available_classes)}")
+    
+    # Map folder names to label IDs
+    class_name_mapping = {}
     for label_id, label_info in LABELS.items():
-        label_name = label_info['name']
-        match_paths = label_info['match_substrings']
+        target_name = label_info['name']
         
-        logging.info(f"\nCollecting {label_name} (ID: {label_id})...")
+        # Find matching folder name (case insensitive, flexible matching)
+        for available_class in available_classes:
+            if (target_name.lower() in available_class.lower() or 
+                available_class.lower() in target_name.lower() or
+                available_class.lower().replace('_', '') == target_name.lower().replace('_', '') or
+                # Special cases
+                (target_name == 'normal' and 'normal' in available_class.lower()) or
+                (target_name == 'blast' and 'blast' in available_class.lower()) or
+                (target_name == 'bacterial_leaf_blight' and 'blight' in available_class.lower()) or
+                (target_name == 'brown_spot' and 'brown' in available_class.lower())):
+                
+                class_name_mapping[available_class] = (label_id, target_name)
+                break
+    
+    logging.info(f"Class mapping: {class_name_mapping}")
+    
+    # Collect images from each split
+    image_extensions = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
+    
+    for split in splits:
+        split_path = os.path.join(data_root, split)
+        if not os.path.exists(split_path):
+            logging.warning(f"Split directory not found: {split_path}")
+            continue
+            
+        logging.info(f"\nCollecting {split} data...")
         
-        for path in match_paths:
-            images = collect_images_from_path(path)
-            if len(images) > 0:
-                logging.info(f"  ✓ {len(images)} images from {path}")
-                for img_path in images:
-                    all_data.append({
-                        'image_path': img_path,
-                        'label_id': label_id,
-                        'label_name': label_name,
-                    })
+        for folder_name in os.listdir(split_path):
+            folder_path = os.path.join(split_path, folder_name)
+            
+            if not os.path.isdir(folder_path):
+                continue
+                
+            if folder_name.lower() not in class_name_mapping:
+                logging.warning(f"Unknown class folder: {folder_name} (skipping)")
+                continue
+            
+            label_id, label_name = class_name_mapping[folder_name.lower()]
+            
+            # Collect images from this class folder
+            images = []
+            for file in os.listdir(folder_path):
+                if file.lower().endswith(image_extensions):
+                    img_path = os.path.join(folder_path, file)
+                    images.append(img_path)
+            
+            logging.info(f"  {label_name} ({folder_name}): {len(images)} images")
+            
+            # Add to data
+            for img_path in images:
+                all_data[split].append({
+                    'image_path': img_path,
+                    'label_id': label_id,
+                    'label_name': label_name,
+                    'split': split,
+                    'original_folder': folder_name
+                })
     
-    df = pd.DataFrame(all_data)
-    logging.info(f"\nTotal: {len(df)} images")
-    logging.info(f"\nBy label:\n{df.groupby('label_name').size()}")
+    # Convert to DataFrames
+    train_df = pd.DataFrame(all_data['train'])
+    test_df = pd.DataFrame(all_data['test']) 
+    val_df = pd.DataFrame(all_data['valid'])
     
-    return df
+    # Combine for overall statistics
+    all_df = pd.concat([train_df, test_df, val_df], ignore_index=True) if len(train_df) > 0 or len(test_df) > 0 or len(val_df) > 0 else pd.DataFrame()
+    
+    logging.info(f"\nDataset Summary:")
+    logging.info(f"Train: {len(train_df)} images")
+    logging.info(f"Test:  {len(test_df)} images") 
+    logging.info(f"Val:   {len(val_df)} images")
+    logging.info(f"Total: {len(all_df)} images")
+    
+    if len(all_df) > 0:
+        logging.info(f"\nOverall distribution:")
+        print(all_df.groupby('label_name').size().sort_index())
+        
+        logging.info(f"\nBy split:")
+        split_dist = all_df.groupby(['split', 'label_name']).size().unstack(fill_value=0)
+        print(split_dist)
+    
+    return train_df, test_df, val_df, all_df
 
-collected_df = auto_collect_dataset()
-collected_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "collected_images.csv"), index=False)
+# Collect dataset
+train_df, test_df, val_df, collected_df = collect_dataset_from_folders()
+
+# Save collected data info
+if len(collected_df) > 0:
+    collected_df.to_csv(os.path.join(OUTPUT_DIRS["results"], "collected_images.csv"), index=False)
+
+# Verify we have data for training
+if len(train_df) == 0:
+    raise ValueError("No training data found! Please check your data directory structure.")
+
+if len(val_df) == 0 and len(test_df) > 0:
+    logging.warning("No validation data found, will use test data for validation during training")
+    val_df = test_df.copy()
 
 # %%
 # ===== DATA VISUALIZATION =====
-def visualize_dataset_distribution(df, output_dir):
-    """Create comprehensive data visualizations"""
+def visualize_dataset_distribution(all_df, train_df, test_df, val_df, output_dir):
+    """Create comprehensive data visualizations for pre-split data"""
     
+    if len(all_df) == 0:
+        logging.warning("No data to visualize")
+        return None
+        
     logging.info("\n" + "="*60)
-    logging.info("CREATING DATA VISUALIZATIONS")
+    logging.info("CREATING BEAUTIFUL DATA VISUALIZATIONS 🎨")
     logging.info("="*60)
     
+    # Set matplotlib style for better aesthetics
+    plt.style.use('seaborn-v0_8-darkgrid')
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['axes.linewidth'] = 1.2
+    plt.rcParams['grid.alpha'] = 0.3
+    
     class_names = [LABELS[i]['name'] for i in sorted(LABELS.keys())]
+    
+    # Check if we have actual data for visualization
+    if 'label_name' not in all_df.columns:
+        logging.error("Column 'label_name' not found in data")
+        return None
+        
+    if 'split' not in all_df.columns:
+        logging.warning("Column 'split' not found, will skip split-based visualizations")
     
     # Create a large figure with multiple subplots
     fig = plt.figure(figsize=(20, 16))
     
-    # 1. Class Distribution Bar Chart
+    # 1. Overall Class Distribution with enhanced styling
     ax1 = plt.subplot(3, 3, 1)
-    class_counts = df.groupby('label_name').size()
-    colors = plt.cm.Set3(np.linspace(0, 1, len(class_counts)))
-    bars = ax1.bar(class_counts.index, class_counts.values, color=colors, alpha=0.8)
-    ax1.set_title('Dataset Distribution by Class', fontweight='bold', fontsize=12)
-    ax1.set_ylabel('Number of Images')
-    ax1.set_xlabel('Disease Class')
-    plt.setp(ax1.get_xticklabels(), rotation=45, ha='right')
+    class_counts = all_df.groupby('label_name').size()
     
-    # Add value labels on bars
-    for bar, count in zip(bars, class_counts.values):
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
-                str(count), ha='center', va='bottom', fontweight='bold')
+    # Beautiful color palette
+    colors = ['#2E86C1', '#28B463', '#F39C12', '#E74C3C', '#8E44AD', '#17A2B8']
+    colors = colors[:len(class_counts)]
     
-    # Add percentage labels
-    total = class_counts.sum()
-    for i, (bar, count) in enumerate(zip(bars, class_counts.values)):
-        pct = (count / total) * 100
-        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height()/2,
-                f'{pct:.1f}%', ha='center', va='center', fontweight='bold', color='white')
+    bars = ax1.bar(class_counts.index, class_counts.values, 
+                   color=colors, alpha=0.85, edgecolor='white', linewidth=1.5)
     
-    # 2. Pie Chart
-    ax2 = plt.subplot(3, 3, 2)
-    wedges, texts, autotexts = ax2.pie(class_counts.values, labels=class_counts.index, 
-                                      autopct='%1.1f%%', colors=colors, startangle=90)
-    ax2.set_title('Class Distribution (Pie Chart)', fontweight='bold', fontsize=12)
+    ax1.set_title('📊 Overall Dataset Distribution', fontweight='bold', fontsize=14, pad=15)
+    ax1.set_ylabel('Number of Images', fontweight='bold', fontsize=11)
+    ax1.set_xlabel('Disease Class', fontweight='bold', fontsize=11)
     
-    # 3. Data Source Distribution
-    ax3 = plt.subplot(3, 3, 3)
-    source_counts = defaultdict(int)
-    for _, row in df.iterrows():
-        path = row['image_path']
-        if 'paddy_disease_train' in path:
-            source_counts['Paddy Disease'] += 1
-        elif 'sikhaok_train' in path:
-            source_counts['Sikhaok'] += 1
-        elif './data/' in path:
-            source_counts['Original Data'] += 1
-        else:
-            source_counts['Other'] += 1
+    # Rotate labels for better readability
+    plt.setp(ax1.get_xticklabels(), rotation=45, ha='right', fontsize=10)
     
-    source_df = pd.Series(source_counts)
-    colors_source = plt.cm.Pastel1(np.linspace(0, 1, len(source_df)))
-    bars = ax3.bar(source_df.index, source_df.values, color=colors_source, alpha=0.8)
-    ax3.set_title('Distribution by Data Source', fontweight='bold', fontsize=12)
-    ax3.set_ylabel('Number of Images')
-    plt.setp(ax3.get_xticklabels(), rotation=45, ha='right')
-    
-    for bar, count in zip(bars, source_df.values):
-        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
-                str(count), ha='center', va='bottom', fontweight='bold')
-    
-    # 4. Class Distribution by Source (Stacked Bar)
-    ax4 = plt.subplot(3, 3, 4)
-    source_class_data = []
-    for source in source_df.index:
-        source_class_counts = []
-        for class_name in class_names:
-            count = 0
-            class_df = df[df['label_name'] == class_name]
-            for _, row in class_df.iterrows():
-                path = row['image_path']
-                if source == 'Paddy Disease' and 'paddy_disease_train' in path:
-                    count += 1
-                elif source == 'Sikhaok' and 'sikhaok_train' in path:
-                    count += 1
-                elif source == 'Original Data' and './data/' in path:
-                    count += 1
-                elif source == 'Other' and not any(x in path for x in ['paddy_disease_train', 'sikhaok_train', './data/']):
-                    count += 1
-            source_class_counts.append(count)
-        source_class_data.append(source_class_counts)
-    
-    # Create stacked bar chart
-    bottom = np.zeros(len(class_names))
-    for i, (source, counts) in enumerate(zip(source_df.index, source_class_data)):
-        ax4.bar(class_names, counts, bottom=bottom, label=source, 
-               color=colors_source[i], alpha=0.8)
-        bottom += counts
-    
-    ax4.set_title('Class Distribution by Data Source', fontweight='bold', fontsize=12)
-    ax4.set_ylabel('Number of Images')
-    ax4.legend()
-    plt.setp(ax4.get_xticklabels(), rotation=45, ha='right')
-    
-    # 5. Histogram of class imbalance
-    ax5 = plt.subplot(3, 3, 5)
-    class_counts_values = class_counts.values
-    ax5.hist(class_counts_values, bins=10, color='skyblue', alpha=0.7, edgecolor='black')
-    ax5.axvline(np.mean(class_counts_values), color='red', linestyle='--', 
-               label=f'Mean: {np.mean(class_counts_values):.0f}')
-    ax5.axvline(np.median(class_counts_values), color='green', linestyle='--', 
-               label=f'Median: {np.median(class_counts_values):.0f}')
-    ax5.set_title('Distribution of Class Sizes', fontweight='bold', fontsize=12)
-    ax5.set_xlabel('Number of Images per Class')
-    ax5.set_ylabel('Frequency')
-    ax5.legend()
-    
-    # 6. Class Imbalance Ratio
-    ax6 = plt.subplot(3, 3, 6)
-    max_count = class_counts.max()
-    imbalance_ratios = max_count / class_counts.values
-    bars = ax6.bar(class_names, imbalance_ratios, color='coral', alpha=0.8)
-    ax6.set_title('Class Imbalance Ratio', fontweight='bold', fontsize=12)
-    ax6.set_ylabel('Imbalance Ratio (Max/Current)')
-    plt.setp(ax6.get_xticklabels(), rotation=45, ha='right')
-    ax6.axhline(y=1, color='green', linestyle='--', alpha=0.7, label='Perfect Balance')
-    ax6.legend()
-    
-    for bar, ratio in zip(bars, imbalance_ratios):
-        ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                f'{ratio:.2f}x', ha='center', va='bottom', fontweight='bold')
-    
-    # 7. Cumulative Distribution
-    ax7 = plt.subplot(3, 3, 7)
-    sorted_counts = np.sort(class_counts.values)
-    cumulative = np.cumsum(sorted_counts)
-    cumulative_pct = (cumulative / total) * 100
-    ax7.plot(range(1, len(sorted_counts)+1), cumulative_pct, 'bo-', linewidth=2, markersize=8)
-    ax7.set_title('Cumulative Class Distribution', fontweight='bold', fontsize=12)
-    ax7.set_xlabel('Class Rank (by size)')
-    ax7.set_ylabel('Cumulative Percentage (%)')
-    ax7.grid(True, alpha=0.3)
-    ax7.set_ylim(0, 100)
-    
-    # 8. Sample Images Grid (if we have access to images)
-    ax8 = plt.subplot(3, 3, 8)
-    try:
-        # Sample one image from each class for preview
-        sample_images = []
-        sample_labels = []
-        
-        for class_name in class_names:
-            class_data = df[df['label_name'] == class_name]
-            if len(class_data) > 0:
-                sample_path = class_data.iloc[0]['image_path']
-                if os.path.exists(sample_path):
-                    try:
-                        img = Image.open(sample_path).convert('RGB')
-                        img = img.resize((64, 64))  # Small size for grid
-                        sample_images.append(np.array(img))
-                        sample_labels.append(class_name)
-                    except:
-                        continue
-        
-        if sample_images:
-            # Create a grid of sample images
-            grid_size = int(np.ceil(np.sqrt(len(sample_images))))
-            grid_img = np.zeros((grid_size * 64, grid_size * 64, 3), dtype=np.uint8)
-            
-            for i, img in enumerate(sample_images):
-                row = i // grid_size
-                col = i % grid_size
-                grid_img[row*64:(row+1)*64, col*64:(col+1)*64] = img
-            
-            ax8.imshow(grid_img)
-            ax8.set_title('Sample Images by Class', fontweight='bold', fontsize=12)
-            ax8.axis('off')
-        else:
-            ax8.text(0.5, 0.5, 'No sample\\nimages available', 
-                    ha='center', va='center', transform=ax8.transAxes, fontsize=12)
-            ax8.set_title('Sample Images', fontweight='bold', fontsize=12)
-    except Exception as e:
-        ax8.text(0.5, 0.5, f'Error loading\\nsample images:\\n{str(e)[:30]}...', 
-                ha='center', va='center', transform=ax8.transAxes, fontsize=10)
-        ax8.set_title('Sample Images', fontweight='bold', fontsize=12)
-    
-    # 9. Statistics Summary Table
-    ax9 = plt.subplot(3, 3, 9)
-    ax9.axis('tight')
-    ax9.axis('off')
-    
-    stats_data = [
-        ['Total Images', f'{total:,}'],
-        ['Number of Classes', f'{len(class_counts)}'],
-        ['Average per Class', f'{np.mean(class_counts.values):.0f}'],
-        ['Std Dev', f'{np.std(class_counts.values):.0f}'],
-        ['Min Class Size', f'{class_counts.min():,}'],
-        ['Max Class Size', f'{class_counts.max():,}'],
-        ['Imbalance Ratio', f'{class_counts.max()/class_counts.min():.2f}:1'],
-        ['Most Common Class', f'{class_counts.idxmax()}'],
-        ['Least Common Class', f'{class_counts.idxmin()}'],
-    ]
-    
-    table = ax9.table(cellText=stats_data, 
-                     colLabels=['Statistic', 'Value'],
-                     cellLoc='center',
-                     loc='center',
-                     colWidths=[0.6, 0.4])
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.2, 1.5)
-    ax9.set_title('Dataset Statistics', fontweight='bold', fontsize=12, pad=20)
-    
-    # Style the table
-    for i in range(len(stats_data) + 1):
-        for j in range(2):
-            cell = table[(i, j)]
-            if i == 0:  # Header row
-                cell.set_facecolor('#4472C4')
-                cell.set_text_props(weight='bold', color='white')
-            else:
-                cell.set_facecolor('#F2F2F2' if i % 2 == 0 else 'white')
-    
-    plt.suptitle('Dataset Analysis & Visualization', fontsize=18, fontweight='bold', y=0.98)
-    plt.tight_layout()
-    
-    # Save the visualization
-    viz_path = os.path.join(output_dir, "dataset_visualization.png")
-    plt.savefig(viz_path, dpi=200, bbox_inches='tight')
-    plt.show()
-    
-    logging.info(f"✓ Dataset visualization saved: {viz_path}")
-    
-    # Create individual charts for better clarity
-    create_individual_charts(df, output_dir, class_counts)
-    
-    return viz_path
-
-def create_individual_charts(df, output_dir, class_counts):
-    """Create individual charts for better clarity"""
-    
-    class_names = [LABELS[i]['name'] for i in sorted(LABELS.keys())]
-    
-    # 1. Enhanced Class Distribution Chart
-    plt.figure(figsize=(12, 8))
-    colors = plt.cm.Set2(np.linspace(0, 1, len(class_counts)))
-    bars = plt.bar(class_counts.index, class_counts.values, color=colors, alpha=0.8, 
-                   edgecolor='black', linewidth=1.5)
-    
-    plt.title('Rice Disease Dataset - Class Distribution', fontweight='bold', fontsize=16, pad=20)
-    plt.ylabel('Number of Images', fontweight='bold', fontsize=12)
-    plt.xlabel('Disease Class', fontweight='bold', fontsize=12)
-    
-    # Add value and percentage labels
+    # Add value labels on top of bars
     total = class_counts.sum()
     for bar, count in zip(bars, class_counts.values):
         height = bar.get_height()
         pct = (count / total) * 100
-        plt.text(bar.get_x() + bar.get_width()/2, height + 20,
-                f'{count:,}\\n({pct:.1f}%)', ha='center', va='bottom', 
-                fontweight='bold', fontsize=11)
+        ax1.text(bar.get_x() + bar.get_width()/2, height + max(class_counts)*0.01,
+                f'{count}\n({pct:.1f}%)', ha='center', va='bottom', 
+                fontweight='bold', fontsize=9)
     
-    plt.xticks(rotation=45, ha='right')
-    plt.grid(True, alpha=0.3, axis='y')
+    # Add grid for better readability
+    ax1.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax1.set_axisbelow(True)
+    
+    # 2. Enhanced Split Distribution (Pie Chart)
+    ax2 = plt.subplot(3, 3, 2)
+    if 'split' in all_df.columns:
+        split_counts = all_df.groupby('split').size()
+        
+        # Beautiful colors for splits
+        split_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1']
+        
+        # Create pie chart with enhanced styling
+        wedges, texts, autotexts = ax2.pie(split_counts.values, 
+                                          labels=split_counts.index, 
+                                          autopct='%1.1f%%',
+                                          colors=split_colors[:len(split_counts)],
+                                          startangle=90,
+                                          explode=[0.05] * len(split_counts),  # Slight separation
+                                          shadow=True,  # Add shadow
+                                          textprops={'fontweight': 'bold', 'fontsize': 10})
+        
+        # Style the percentage text
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontweight('bold')
+            autotext.set_fontsize(10)
+        
+        ax2.set_title('📈 Train/Val/Test Split Distribution', fontweight='bold', fontsize=14, pad=15)
+    else:
+        ax2.text(0.5, 0.5, '❌ Split information\nnot available', 
+                ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+        ax2.set_title('📈 Split Distribution', fontweight='bold', fontsize=14)
+    
+    # 3. Class Distribution by Split (Stacked Bar)
+    ax3 = plt.subplot(3, 3, 3)
+    if 'split' in all_df.columns:
+        split_class_data = all_df.groupby(['split', 'label_name']).size().unstack(fill_value=0)
+        split_class_data.plot(kind='bar', stacked=True, ax=ax3, color=colors[:len(class_names)])
+        ax3.set_title('Class Distribution by Split', fontweight='bold', fontsize=12)
+        ax3.set_xlabel('Split')
+        ax3.set_ylabel('Number of Images')
+        ax3.legend(title='Class', bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.setp(ax3.get_xticklabels(), rotation=0)
+    else:
+        ax3.text(0.5, 0.5, 'Split information\nnot available', ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Class Distribution by Split', fontweight='bold', fontsize=12)
+    
+    # 4. Enhanced Detailed Split Comparison (Grouped Bar)
+    ax4 = plt.subplot(3, 3, 4)
+    x = np.arange(len(class_names))
+    width = 0.25
+    
+    # Get counts, handling missing classes
+    train_counts = []
+    val_counts = []
+    test_counts = []
+    
+    for cls in class_names:
+        train_count = len(train_df[train_df['label_name'] == cls]) if len(train_df) > 0 else 0
+        val_count = len(val_df[val_df['label_name'] == cls]) if len(val_df) > 0 else 0
+        test_count = len(test_df[test_df['label_name'] == cls]) if len(test_df) > 0 else 0
+        
+        train_counts.append(train_count)
+        val_counts.append(val_count)
+        test_counts.append(test_count)
+    
+    # Enhanced colors and styling
+    bar1 = ax4.bar(x - width, train_counts, width, label='🏋️ Train', 
+                   color='#FF6B6B', alpha=0.9, edgecolor='white', linewidth=1)
+    bar2 = ax4.bar(x, val_counts, width, label='📊 Validation', 
+                   color='#4ECDC4', alpha=0.9, edgecolor='white', linewidth=1)
+    bar3 = ax4.bar(x + width, test_counts, width, label='🧪 Test', 
+                   color='#45B7D1', alpha=0.9, edgecolor='white', linewidth=1)
+    
+    # Add value labels on bars
+    for bars, counts in [(bar1, train_counts), (bar2, val_counts), (bar3, test_counts)]:
+        for bar, count in zip(bars, counts):
+            if count > 0:  # Only show label if count > 0
+                ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                        f'{count}', ha='center', va='bottom', fontweight='bold', fontsize=8)
+    
+    ax4.set_title('🔍 Detailed Split Comparison', fontweight='bold', fontsize=14, pad=15)
+    ax4.set_xlabel('Disease Class', fontweight='bold', fontsize=11)
+    ax4.set_ylabel('Number of Images', fontweight='bold', fontsize=11)
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(class_names, rotation=45, ha='right', fontsize=10)
+    
+    # Enhanced legend
+    ax4.legend(loc='upper right', frameon=True, fancybox=True, shadow=True, fontsize=10)
+    ax4.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax4.set_axisbelow(True)
+    
+    # 5. Enhanced Class Imbalance Analysis
+    ax5 = plt.subplot(3, 3, 5)
+    max_count = class_counts.max()
+    imbalance_ratios = max_count / class_counts.values
+    
+    # Color coding: green for balanced, yellow for moderate, red for severe imbalance
+    bar_colors = []
+    for ratio in imbalance_ratios:
+        if ratio <= 1.5:
+            bar_colors.append('#2ECC71')  # Green - well balanced
+        elif ratio <= 3.0:
+            bar_colors.append('#F39C12')  # Orange - moderate imbalance
+        else:
+            bar_colors.append('#E74C3C')  # Red - severe imbalance
+    
+    bars = ax5.bar(class_names, imbalance_ratios, color=bar_colors, alpha=0.9, 
+                   edgecolor='white', linewidth=1.5)
+    
+    ax5.set_title('⚖️ Class Imbalance Analysis', fontweight='bold', fontsize=14, pad=15)
+    ax5.set_ylabel('Imbalance Ratio (Max/Current)', fontweight='bold', fontsize=11)
+    plt.setp(ax5.get_xticklabels(), rotation=45, ha='right', fontsize=10)
+    
+    # Reference lines
+    ax5.axhline(y=1, color='#2ECC71', linestyle='--', alpha=0.8, linewidth=2, label='Perfect Balance')
+    ax5.axhline(y=2, color='#F39C12', linestyle='--', alpha=0.6, linewidth=1.5, label='Moderate Imbalance')
+    ax5.axhline(y=3, color='#E74C3C', linestyle='--', alpha=0.6, linewidth=1.5, label='Severe Imbalance')
+    
+    # Enhanced legend
+    ax5.legend(loc='upper right', frameon=True, fancybox=True, shadow=True, fontsize=9)
+    ax5.grid(True, alpha=0.3, axis='y', linestyle=':')
+    ax5.set_axisbelow(True)
+    
+    # Value labels with color coding
+    for bar, ratio in zip(bars, imbalance_ratios):
+        label_color = 'white' if ratio > 2 else 'black'
+        ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
+                f'{ratio:.2f}x', ha='center', va='bottom', fontweight='bold', 
+                fontsize=9, color='black')
+    
+    # 6. Enhanced Split Percentage by Class
+    ax6 = plt.subplot(3, 3, 6)
+    
+    # Calculate percentages for each class across splits
+    class_percentages = {}
+    for class_name in class_names:
+        train_count = len(train_df[train_df['label_name'] == class_name]) if len(train_df) > 0 else 0
+        val_count = len(val_df[val_df['label_name'] == class_name]) if len(val_df) > 0 else 0
+        test_count = len(test_df[test_df['label_name'] == class_name]) if len(test_df) > 0 else 0
+        total_class = train_count + val_count + test_count
+        
+        if total_class > 0:
+            class_percentages[class_name] = {
+                'Train': (train_count / total_class) * 100,
+                'Val': (val_count / total_class) * 100,
+                'Test': (test_count / total_class) * 100
+            }
+        else:
+            class_percentages[class_name] = {'Train': 0, 'Val': 0, 'Test': 0}
+    
+    # Create enhanced stacked percentage bar chart
+    train_pcts = [class_percentages[cls]['Train'] for cls in class_names]
+    val_pcts = [class_percentages[cls]['Val'] for cls in class_names]
+    test_pcts = [class_percentages[cls]['Test'] for cls in class_names]
+    
+    # Beautiful gradient colors
+    p1 = ax6.bar(class_names, train_pcts, label='🏋️ Train', 
+                 color='#FF6B6B', alpha=0.9, edgecolor='white', linewidth=1)
+    p2 = ax6.bar(class_names, val_pcts, bottom=train_pcts, label='📊 Val', 
+                 color='#4ECDC4', alpha=0.9, edgecolor='white', linewidth=1)
+    p3 = ax6.bar(class_names, test_pcts, bottom=np.array(train_pcts) + np.array(val_pcts), 
+                 label='🧪 Test', color='#45B7D1', alpha=0.9, edgecolor='white', linewidth=1)
+    
+    # Add percentage labels inside bars
+    for i, class_name in enumerate(class_names):
+        # Train percentage
+        if train_pcts[i] > 5:  # Only show if segment is large enough
+            ax6.text(i, train_pcts[i]/2, f'{train_pcts[i]:.0f}%', 
+                    ha='center', va='center', fontweight='bold', fontsize=9, color='white')
+        # Val percentage
+        if val_pcts[i] > 5:
+            ax6.text(i, train_pcts[i] + val_pcts[i]/2, f'{val_pcts[i]:.0f}%', 
+                    ha='center', va='center', fontweight='bold', fontsize=9, color='white')
+        # Test percentage
+        if test_pcts[i] > 5:
+            ax6.text(i, train_pcts[i] + val_pcts[i] + test_pcts[i]/2, f'{test_pcts[i]:.0f}%', 
+                    ha='center', va='center', fontweight='bold', fontsize=9, color='white')
+    
+    ax6.set_title('📊 Split Distribution by Class', fontweight='bold', fontsize=14, pad=15)
+    ax6.set_xlabel('Disease Class', fontweight='bold', fontsize=11)
+    ax6.set_ylabel('Percentage (%)', fontweight='bold', fontsize=11)
+    ax6.set_ylim(0, 100)
+    plt.setp(ax6.get_xticklabels(), rotation=45, ha='right', fontsize=10)
+    
+    # Enhanced legend
+    ax6.legend(loc='upper right', frameon=True, fancybox=True, shadow=True, fontsize=10)
+    ax6.grid(True, alpha=0.3, axis='y', linestyle=':')
+    ax6.set_axisbelow(True)
+    
+    # 7-9. Enhanced Sample Images Showcase
+    sample_axes = [plt.subplot(3, 3, i) for i in [7, 8, 9]]
+    
+    try:
+        sample_images_per_class = 4  # Show more samples
+        subplot_idx = 0
+        
+        # Get available class names from actual data
+        available_classes = all_df['label_name'].unique() if len(all_df) > 0 else []
+        
+        # Class emojis for visual appeal
+        class_emojis = {
+            'brown_spot': '🍂',
+            'blast': '🔥', 
+            'bacterial_leaf_blight': '🦠',
+            'normal': '🌱'
+        }
+        
+        for class_name in available_classes[:3]:  # Show first 3 available classes
+            if subplot_idx >= len(sample_axes):
+                break
+                
+            ax = sample_axes[subplot_idx]
+            class_data = all_df[all_df['label_name'] == class_name]
+            
+            if len(class_data) > 0:
+                # Sample images from this class
+                sample_paths = class_data.sample(min(sample_images_per_class, len(class_data)), 
+                                               random_state=42)['image_path'].tolist()
+                
+                # Create enhanced mini grid
+                grid_size = int(np.ceil(np.sqrt(len(sample_paths))))
+                fig_size = 80 * grid_size  # Larger images
+                grid_img = np.zeros((fig_size, fig_size, 3), dtype=np.uint8)
+                
+                for i, img_path in enumerate(sample_paths):
+                    if os.path.exists(img_path):
+                        try:
+                            img = Image.open(img_path).convert('RGB')
+                            img = img.resize((80, 80))  # Larger size
+                            img_array = np.array(img)
+                            
+                            row = i // grid_size
+                            col = i % grid_size
+                            grid_img[row*80:(row+1)*80, col*80:(col+1)*80] = img_array
+                        except Exception as e:
+                            logging.warning(f"Could not load sample image {img_path}: {e}")
+                
+                ax.imshow(grid_img)
+                emoji = class_emojis.get(class_name, '🌿')
+                ax.set_title(f'{emoji} {class_name.title()} Samples', 
+                           fontweight='bold', fontsize=11, pad=10)
+                ax.axis('off')
+                
+                # Add border around the image
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_linewidth(2)
+                    spine.set_edgecolor('#E0E0E0')
+            else:
+                ax.text(0.5, 0.5, f'❌ No {class_name}\nimages found', 
+                       ha='center', va='center', transform=ax.transAxes,
+                       fontsize=12, fontweight='bold', color='#E74C3C')
+                emoji = class_emojis.get(class_name, '🌿')
+                ax.set_title(f'{emoji} {class_name.title()}', 
+                           fontweight='bold', fontsize=11, pad=10)
+                ax.axis('off')
+            
+            subplot_idx += 1
+            
+    except Exception as e:
+        logging.warning(f"Could not create sample images: {e}")
+        for i, ax in enumerate(sample_axes):
+            ax.text(0.5, 0.5, '🖼️ Sample images\nnot available', 
+                   ha='center', va='center', transform=ax.transAxes,
+                   fontsize=11, fontweight='bold', color='#95A5A6')
+            ax.set_title(f'🖼️ Sample Images {i+1}', fontweight='bold', fontsize=11)
+            ax.axis('off')
+    
+
+    
+    # Enhanced title with emojis and better styling
+    plt.suptitle('🌾 Rice Disease Dataset - Comprehensive Analysis 📈', 
+                 fontsize=20, fontweight='bold', y=0.98, 
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor='lightblue', alpha=0.8))
+    
+    # Set background color for the entire figure
+    fig.patch.set_facecolor('#FAFAFA')
+    
+    # Improve layout with more spacing
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save visualization with higher quality
+    viz_path = os.path.join(output_dir, "dataset_visualization.png")
+    plt.savefig(viz_path, dpi=300, bbox_inches='tight', 
+               facecolor='#FAFAFA', edgecolor='none')
+    plt.show()
+    
+    logging.info(f"✓ Dataset visualization saved: {viz_path}")
+    
+    return viz_path
+
+def create_individual_charts(all_df, output_dir, class_counts):
+    """Create individual charts for better clarity"""
+    
+    class_names = [LABELS[i]['name'] for i in sorted(LABELS.keys())]
+    
+    # 1. Enhanced Class Distribution Chart with beautiful styling
+    plt.figure(figsize=(14, 10), facecolor='white')
+    
+    # Beautiful gradient colors
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD']
+    colors = colors[:len(class_counts)]
+    
+    bars = plt.bar(class_counts.index, class_counts.values, 
+                   color=colors, alpha=0.9, 
+                   edgecolor='white', linewidth=2.5,
+                   width=0.7)  # Slightly thinner bars
+    
+    # Add gradient effect
+    for bar in bars:
+        bar.set_capstyle('round')
+    
+    plt.title('🌾 Rice Disease Dataset - Class Distribution Analysis 📈', 
+              fontweight='bold', fontsize=18, pad=25,
+              bbox=dict(boxstyle='round,pad=0.8', facecolor='lightblue', alpha=0.7))
+    plt.ylabel('Number of Images', fontweight='bold', fontsize=14)
+    plt.xlabel('Disease Class', fontweight='bold', fontsize=14)
+    
+    # Add value and percentage labels with better positioning
+    total = class_counts.sum()
+    for bar, count in zip(bars, class_counts.values):
+        height = bar.get_height()
+        pct = (count / total) * 100
+        plt.text(bar.get_x() + bar.get_width()/2, height + max(class_counts)*0.02,
+                f'{count:,}\n({pct:.1f}%)', ha='center', va='bottom', 
+                fontweight='bold', fontsize=12,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+    
+    plt.xticks(rotation=45, ha='right', fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.grid(True, alpha=0.3, axis='y', linestyle='--')
+    
+    # Set background
+    plt.gca().set_facecolor('#FAFAFA')
     plt.tight_layout()
     
     chart_path = os.path.join(output_dir, "class_distribution_detailed.png")
-    plt.savefig(chart_path, dpi=200, bbox_inches='tight')
+    plt.savefig(chart_path, dpi=300, bbox_inches='tight', 
+               facecolor='white', edgecolor='none')
     plt.show()
     
-    # 2. Data Source Analysis
-    plt.figure(figsize=(14, 10))
+    # 2. Enhanced Split Analysis with beautiful styling
+    plt.figure(figsize=(16, 10), facecolor='white')
     
-    # Create source analysis data
-    source_data = {class_name: {'Paddy Disease': 0, 'Sikhaok': 0, 'Original Data': 0, 'Other': 0} 
+    # Create split analysis data
+    source_data = {class_name: {'Train': 0, 'Val': 0, 'Test': 0, 'Other': 0} 
                   for class_name in class_names}
     
-    for _, row in df.iterrows():
+    for _, row in all_df.iterrows():
         class_name = row['label_name']
-        path = row['image_path']
+        split = row.get('split', 'unknown')
         
-        if 'paddy_disease_train' in path:
-            source_data[class_name]['Paddy Disease'] += 1
-        elif 'sikhaok_train' in path:
-            source_data[class_name]['Sikhaok'] += 1
-        elif './data/' in path:
-            source_data[class_name]['Original Data'] += 1
+        # Count by split instead of source
+        if split == 'train':
+            source_data[class_name]['Train'] += 1
+        elif split == 'val' or split == 'valid':
+            source_data[class_name]['Val'] += 1
+        elif split == 'test':
+            source_data[class_name]['Test'] += 1
         else:
             source_data[class_name]['Other'] += 1
     
-    # Create grouped bar chart
+    # Create enhanced grouped bar chart
     x = np.arange(len(class_names))
     width = 0.2
-    sources = ['Paddy Disease', 'Sikhaok', 'Original Data', 'Other']
-    colors_src = ['#FF9999', '#66B2FF', '#99FF99', '#FFCC99']
+    sources = ['Train', 'Val', 'Test', 'Other']
+    colors_src = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
     
+    bars_list = []
     for i, source in enumerate(sources):
         values = [source_data[class_name][source] for class_name in class_names]
-        plt.bar(x + i * width, values, width, label=source, color=colors_src[i], alpha=0.8)
+        bars = plt.bar(x + i * width, values, width, label=f'📊 {source}', 
+                      color=colors_src[i], alpha=0.9, 
+                      edgecolor='white', linewidth=1.5)
+        bars_list.append((bars, values))
+        
+        # Add value labels on bars
+        for bar, val in zip(bars, values):
+            if val > 0:
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                        f'{val}', ha='center', va='bottom', fontweight='bold', fontsize=9)
     
-    plt.title('Data Distribution by Source and Class', fontweight='bold', fontsize=16, pad=20)
-    plt.xlabel('Disease Class', fontweight='bold', fontsize=12)
-    plt.ylabel('Number of Images', fontweight='bold', fontsize=12)
-    plt.xticks(x + width * 1.5, class_names, rotation=45, ha='right')
-    plt.legend()
-    plt.grid(True, alpha=0.3, axis='y')
+    plt.title('🔄 Data Distribution by Split and Class', fontweight='bold', fontsize=18, pad=25,
+              bbox=dict(boxstyle='round,pad=0.8', facecolor='lightgreen', alpha=0.7))
+    plt.xlabel('Disease Class', fontweight='bold', fontsize=14)
+    plt.ylabel('Number of Images', fontweight='bold', fontsize=14)
+    plt.xticks(x + width * 1.5, class_names, rotation=45, ha='right', fontsize=12)
+    plt.yticks(fontsize=12)
+    
+    # Enhanced legend
+    plt.legend(loc='upper right', frameon=True, fancybox=True, shadow=True, 
+               fontsize=12, title='Data Splits', title_fontsize=13)
+    plt.grid(True, alpha=0.3, axis='y', linestyle='--')
+    
+    # Set background
+    plt.gca().set_facecolor('#FAFAFA')
     plt.tight_layout()
     
-    source_chart_path = os.path.join(output_dir, "data_source_analysis.png")
-    plt.savefig(source_chart_path, dpi=200, bbox_inches='tight')
+    source_chart_path = os.path.join(output_dir, "data_split_analysis.png")
+    plt.savefig(source_chart_path, dpi=300, bbox_inches='tight',
+               facecolor='white', edgecolor='none')
     plt.show()
     
     logging.info(f"✓ Individual charts saved:")
     logging.info(f"  - {chart_path}")
     logging.info(f"  - {source_chart_path}")
 
-# Create data visualizations
-visualize_dataset_distribution(collected_df, OUTPUT_DIRS["plots"])
+# Create data visualizations (only if we have data)
+if len(collected_df) > 0:
+    visualize_dataset_distribution(collected_df, train_df, test_df, val_df, OUTPUT_DIRS["plots"])
 
 # %%
-# Split data
-train_val_df, test_df = train_test_split(
-    collected_df, test_size=CONFIG['test_size'], random_state=42, stratify=collected_df['label_id']
-)
-train_df, val_df = train_test_split(
-    train_val_df, test_size=CONFIG['val_size']/(1-CONFIG['test_size']), 
-    random_state=42, stratify=train_val_df['label_id']
-)
-
-logging.info(f"\nData splits:")
+# Data splits already available from folder structure
+logging.info(f"\nData splits (from folder structure):")
 logging.info(f"Train: {len(train_df)} ({len(train_df)/len(collected_df)*100:.1f}%)")
 logging.info(f"Val:   {len(val_df)} ({len(val_df)/len(collected_df)*100:.1f}%)")
 logging.info(f"Test:  {len(test_df)} ({len(test_df)/len(collected_df)*100:.1f}%)")
